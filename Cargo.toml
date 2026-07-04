@@ -1,0 +1,16 @@
+[package]
+name = "bridle"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal, provider-agnostic coding agent harness"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.12", features = ["json"] }
+wait-timeout = "0.2"
+
+[profile.release]
+lto = true
+strip = true
