@@ -68,17 +68,42 @@ Flags override env; env overrides defaults.
 Put an `AGENTS.md` (or `CLAUDE.md`) in your working directory and its content
 is appended to the system prompt. That's the whole customization model.
 
+## The refine engine and `bridle-arc`
+
+Beyond the interactive agent, bridle ships the other fundamental harness
+pattern: **generate → verify → revise**. The `refine` module samples
+candidates from the model, scores them with a deterministic verifier, and
+feeds scores plus failure diffs back so the model evolves its best attempts
+across rounds — the pattern behind the strongest ARC-AGI results
+([Greenblatt's sample-and-verify](https://arcprize.org/blog/beat-arc-agi-deep-learning-and-program-synthesis),
+Berman's evolutionary test-time compute,
+[Pang's evolutionary program synthesis](https://ctpang.substack.com/p/arc-agi-2-sota-efficient-evolutionary)),
+generalized to anything with a verifier.
+
+`bridle-arc` applies it to ARC-AGI tasks: the model writes Python
+`transform` programs, bridle executes them against the task's training
+pairs, failures come back as exact expected-vs-got grid diffs, and the
+winning program produces the test predictions.
+
+```sh
+bridle-arc --rounds 3 --samples 5 task.json   # predictions as JSON on stdout
+```
+
 ## Architecture
 
 ```
 src/
-  tools.rs      Tool trait + registry + read/write/edit/bash
-  providers.rs  Provider trait + neutral Message type + Anthropic/OpenAI clients
-  agent.rs      the loop: complete → run tools → feed back → repeat
-  session.rs    append-only JSONL persistence, resume
-  context.rs    system prompt builder (base + AGENTS.md)
-  config.rs     env + flag resolution
-  main.rs       thin CLI over the library
+  tools.rs         Tool trait + registry + read/write/edit/bash
+  providers.rs     Provider trait + neutral Message type + Anthropic/OpenAI clients
+  agent.rs         the loop: complete → run tools → feed back → repeat
+  refine.rs        generate–verify–revise engine (evolutionary test-time compute)
+  arc.rs           ARC-AGI harness: prompts, python runner, grid verifier
+  session.rs       append-only JSONL persistence, resume
+  context.rs       system prompt builder (base + AGENTS.md)
+  process.rs       shared subprocess runner (timeout, deadlock-safe)
+  config.rs        env + flag resolution
+  main.rs          bridle CLI
+  bin/bridle-arc.rs  ARC solver CLI
 ```
 
 Request building and response parsing are pure functions over JSON values, so
