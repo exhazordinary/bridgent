@@ -5,6 +5,7 @@
 //! model stops calling tools, provider-neutral message types, and persistent
 //! JSONL sessions.
 
+pub mod agent;
 pub mod context;
 pub mod providers;
 pub mod session;
