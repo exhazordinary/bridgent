@@ -6,4 +6,5 @@
 //! JSONL sessions.
 
 pub mod providers;
+pub mod session;
 pub mod tools;
