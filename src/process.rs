@@ -42,8 +42,14 @@ pub fn run_with_timeout(
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() });
-    let mut child = command.spawn().map_err(|e| ProcessError::Spawn(e.to_string()))?;
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command
+        .spawn()
+        .map_err(|e| ProcessError::Spawn(e.to_string()))?;
 
     if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
         // Ignore broken pipes: the child may exit before reading everything.
@@ -85,7 +91,9 @@ mod tests {
     #[test]
     fn captures_stdout_stderr_and_exit_code() {
         let out = run_with_timeout(
-            Command::new("sh").arg("-c").arg("echo out; echo err >&2; exit 3"),
+            Command::new("sh")
+                .arg("-c")
+                .arg("echo out; echo err >&2; exit 3"),
             None,
             Duration::from_secs(10),
         )
@@ -108,12 +116,8 @@ mod tests {
 
     #[test]
     fn times_out_and_kills() {
-        let err = run_with_timeout(
-            Command::new("sleep").arg("5"),
-            None,
-            Duration::from_secs(1),
-        )
-        .unwrap_err();
+        let err = run_with_timeout(Command::new("sleep").arg("5"), None, Duration::from_secs(1))
+            .unwrap_err();
         assert_eq!(err, ProcessError::TimedOut(Duration::from_secs(1)));
     }
 

@@ -342,7 +342,10 @@ impl Tool for BashTool {
                 .unwrap_or(Self::DEFAULT_TIMEOUT_SECS),
         );
         let result = run_with_timeout(
-            Command::new("sh").arg("-c").arg(command).current_dir(&self.workdir),
+            Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&self.workdir),
             None,
             timeout,
         );
