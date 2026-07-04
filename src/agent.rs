@@ -8,12 +8,12 @@
 use std::time::Duration;
 
 use crate::providers::{Message, Provider, ProviderError, Role, ToolCall};
+use crate::session::Session;
+use crate::tools::{ToolRegistry, ToolResult};
 
 fn history_chars(messages: &[Message]) -> usize {
     messages.iter().map(|m| m.content.len()).sum()
 }
-use crate::session::Session;
-use crate::tools::{ToolRegistry, ToolResult};
 
 /// Progress notifications emitted while a turn runs, for the UI layer.
 pub enum Event<'a> {

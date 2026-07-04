@@ -49,16 +49,24 @@ impl Session {
         })
     }
 
+    /// All session files in `workdir`, oldest first.
+    pub fn list(workdir: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = fs::read_dir(sessions_dir(workdir))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        paths
+    }
+
     /// Resume the most recent session in `workdir`, if any exists.
     pub fn latest(workdir: &Path) -> Option<std::io::Result<Self>> {
-        let mut paths: Vec<PathBuf> = fs::read_dir(sessions_dir(workdir))
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-            .collect();
-        paths.sort();
-        paths.pop().map(|path| Self::open(&path))
+        Self::list(workdir).pop().map(|path| Self::open(&path))
     }
 
     /// Append a message to memory and disk (flushed immediately).

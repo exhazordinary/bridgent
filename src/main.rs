@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use bridgent::agent::{Agent, Event};
 use bridgent::config::Config;
 use bridgent::context::system_prompt;
+use bridgent::providers::Usage;
 use bridgent::session::Session;
 use bridgent::tools::default_registry;
 
@@ -19,11 +20,14 @@ Usage:
 
 Options:
   -c, --continue          resume the most recent session
+      --sessions          list sessions in this directory and exit
       --provider <NAME>   anthropic (default) or openai
       --model <MODEL>     model id (default per provider)
       --base-url <URL>    override API base URL (local models, proxies)
   -h, --help              show this help
   -V, --version           show version
+
+In the REPL, /help lists session commands (/new, /compact, /usage).
 
 Environment:
   ANTHROPIC_API_KEY / OPENAI_API_KEY   provider credentials
@@ -32,6 +36,7 @@ Environment:
 struct Args {
     prompt: Option<String>,
     resume: bool,
+    list_sessions: bool,
     provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
@@ -41,6 +46,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     let mut args = Args {
         prompt: None,
         resume: false,
+        list_sessions: false,
         provider: None,
         model: None,
         base_url: None,
@@ -63,6 +69,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-c" | "--continue" => args.resume = true,
+            "--sessions" => args.list_sessions = true,
             "--provider" => args.provider = Some(flag_value("--provider")?),
             "--model" => args.model = Some(flag_value("--model")?),
             "--base-url" => args.base_url = Some(flag_value("--base-url")?),
@@ -106,14 +113,41 @@ fn run() -> Result<(), String> {
         return Ok(());
     };
 
+    let workdir: PathBuf =
+        std::env::current_dir().map_err(|e| format!("cannot resolve working directory: {e}"))?;
+
+    if args.list_sessions {
+        let paths = Session::list(&workdir);
+        if paths.is_empty() {
+            eprintln!("no sessions in {}", workdir.display());
+        }
+        for path in paths {
+            match Session::open(&path) {
+                Ok(session) => {
+                    let first = session
+                        .messages
+                        .iter()
+                        .find(|m| m.role == bridgent::providers::Role::User)
+                        .map_or("(empty)", |m| m.content.as_str());
+                    let first: String = first.chars().take(60).collect();
+                    println!(
+                        "{}  {} msgs  {first}",
+                        path.display(),
+                        session.messages.len()
+                    );
+                }
+                Err(e) => eprintln!("{}  (unreadable: {e})", path.display()),
+            }
+        }
+        return Ok(());
+    }
+
     let config = Config::resolve(
         |key| std::env::var(key).ok(),
         args.provider.as_deref(),
         args.model.as_deref(),
         args.base_url.as_deref(),
     )?;
-    let workdir: PathBuf =
-        std::env::current_dir().map_err(|e| format!("cannot resolve working directory: {e}"))?;
     let provider = config.build_provider();
     let tools = default_registry(&workdir);
     let agent = Agent::new(provider.as_ref(), &tools, system_prompt(&workdir));
@@ -159,11 +193,58 @@ fn run() -> Result<(), String> {
         if input.is_empty() {
             return Ok(());
         }
+        if let Some(command) = input.strip_prefix('/') {
+            match run_command(command, &agent, &mut session, &workdir) {
+                Ok(output) => eprintln!("{output}\n"),
+                Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
+            }
+            continue;
+        }
         match agent.run_turn(&mut session, input, print_event) {
             Ok(answer) => println!("{answer}\n"),
             // Provider errors don't kill the REPL; the session file is intact.
             Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
         }
+    }
+}
+
+/// REPL slash commands. Everything else in the loop goes to the model.
+fn run_command(
+    command: &str,
+    agent: &Agent,
+    session: &mut Session,
+    workdir: &std::path::Path,
+) -> Result<String, String> {
+    match command {
+        "help" => Ok("/new      start a fresh session\n\
+                      /compact  summarize old history to reclaim context\n\
+                      /usage    token totals for this session\n\
+                      /help     this text"
+            .into()),
+        "new" => {
+            *session = Session::create(workdir).map_err(|e| e.to_string())?;
+            Ok("started a fresh session".into())
+        }
+        "compact" => match agent.compact(session).map_err(|e| e.to_string())? {
+            true => Ok(format!(
+                "history compacted to {} messages",
+                session.messages.len()
+            )),
+            false => Ok("nothing to compact yet".into()),
+        },
+        "usage" => {
+            let mut total = Usage::default();
+            for usage in session.messages.iter().filter_map(|m| m.usage) {
+                total.add(usage);
+            }
+            Ok(format!(
+                "session: {} messages · {} input + {} output tokens",
+                session.messages.len(),
+                total.input_tokens,
+                total.output_tokens
+            ))
+        }
+        other => Err(format!("unknown command /{other} (try /help)")),
     }
 }
 
