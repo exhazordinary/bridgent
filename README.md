@@ -1,0 +1,100 @@
+# bridle
+
+A minimal, provider-agnostic coding agent harness in Rust. Single static
+binary, four tools, no bloat.
+
+> An agent is a model plus a harness. The model is rented; the harness is
+> yours. This is the harness.
+
+*(Working name — a bridle is part of a horse harness. Rename with one line in
+`Cargo.toml`.)*
+
+## Why
+
+Built on the converging lessons of harness-engineering research and practice:
+
+- **Four tools are enough.** `read`, `write`, `edit`, `bash`. Frontier models
+  are RL-trained as coding agents; everything else (search, git, tests,
+  process control) goes through bash. *(pi)*
+- **A minimal system prompt beats a clever one.** Under 200 words, plus your
+  project's own `AGENTS.md`. Nothing is injected that you can't see in your
+  repo. *(pi)*
+- **The loop just loops.** Call the model, run the tools it asks for, feed
+  results back, repeat until it answers in plain text. No step limits.
+- **Errors are feedback, not failures.** Tool errors go back to the model
+  verbatim so it can correct course; transient provider errors retry with
+  backoff. *(Anthropic, "Effective harnesses for long-running agents")*
+- **State lives in files.** Sessions are append-only JSONL in
+  `.bridle/sessions/` — crash-safe, greppable, resumable. *(hermes)*
+- **Core is separate from frontend.** The library (`bridle::agent`,
+  `bridle::tools`, `bridle::providers`, `bridle::session`) has no CLI
+  dependency; the binary is a thin client. *(opencode)*
+
+## Install
+
+```sh
+cargo install --path .
+```
+
+## Usage
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+
+bridle "fix the failing test in this repo"   # one-shot
+bridle                                       # interactive REPL
+bridle -c                                    # resume the latest session
+```
+
+Any OpenAI-compatible server works, including local models:
+
+```sh
+bridle --provider openai --base-url http://localhost:11434/v1 --model qwen3 "hi"
+```
+
+### Configuration
+
+| Flag | Env var | Default |
+|---|---|---|
+| `--provider` | `BRIDLE_PROVIDER` | `anthropic` |
+| `--model` | `BRIDLE_MODEL` | per provider |
+| `--base-url` | `BRIDLE_BASE_URL` | provider default |
+| — | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | required (unless `--base-url` is set) |
+
+Flags override env; env overrides defaults.
+
+### Project instructions
+
+Put an `AGENTS.md` (or `CLAUDE.md`) in your working directory and its content
+is appended to the system prompt. That's the whole customization model.
+
+## Architecture
+
+```
+src/
+  tools.rs      Tool trait + registry + read/write/edit/bash
+  providers.rs  Provider trait + neutral Message type + Anthropic/OpenAI clients
+  agent.rs      the loop: complete → run tools → feed back → repeat
+  session.rs    append-only JSONL persistence, resume
+  context.rs    system prompt builder (base + AGENTS.md)
+  config.rs     env + flag resolution
+  main.rs       thin CLI over the library
+```
+
+Request building and response parsing are pure functions over JSON values, so
+every provider quirk is unit-tested without a network. The agent loop is
+tested against a scripted mock provider. `cargo test` runs the whole suite in
+about a second.
+
+## Non-goals (for now)
+
+Streaming output, MCP, sub-agents, built-in todo lists, plan modes. Most of
+these are better served by bash and files; the rest can land later without
+touching the core.
+
+## References
+
+- [Code as Agent Harness](https://arxiv.org/abs/2605.18747) (survey)
+- [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) (Anthropic)
+- [What I learned building an opinionated and minimal coding agent](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/) (pi)
+- [opencode](https://github.com/sst/opencode) · [hermes-agent](https://github.com/NousResearch/hermes-agent)
