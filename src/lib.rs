@@ -4,3 +4,5 @@
 //! core tools (read, write, edit, bash), an agent loop that runs until the
 //! model stops calling tools, provider-neutral message types, and persistent
 //! JSONL sessions.
+
+pub mod tools;
