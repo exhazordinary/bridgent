@@ -27,7 +27,10 @@ impl Session {
             .as_millis();
         let path = dir.join(format!("{stamp}.jsonl"));
         File::create(&path)?;
-        Ok(Self { path, messages: Vec::new() })
+        Ok(Self {
+            path,
+            messages: Vec::new(),
+        })
     }
 
     /// Load an existing session file, skipping lines that fail to parse so
@@ -40,7 +43,10 @@ impl Session {
             .iter()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
-        Ok(Self { path: path.to_path_buf(), messages })
+        Ok(Self {
+            path: path.to_path_buf(),
+            messages,
+        })
     }
 
     /// Resume the most recent session in `workdir`, if any exists.
@@ -84,10 +90,16 @@ mod tests {
         session
             .append(Message::assistant(
                 "reading",
-                vec![ToolCall { id: "t1".into(), name: "read".into(), args: json!({"path": "a"}) }],
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    args: json!({"path": "a"}),
+                }],
             ))
             .unwrap();
-        session.append(Message::tool_result("t1", "data", false)).unwrap();
+        session
+            .append(Message::tool_result("t1", "data", false))
+            .unwrap();
 
         let reopened = Session::open(&session.path).unwrap();
         assert_eq!(reopened.messages, session.messages);
@@ -101,7 +113,10 @@ mod tests {
         session.append(Message::user("hi")).unwrap();
         fs::write(
             &session.path,
-            format!("{}\nnot json at all\n", serde_json::to_string(&Message::user("hi")).unwrap()),
+            format!(
+                "{}\nnot json at all\n",
+                serde_json::to_string(&Message::user("hi")).unwrap()
+            ),
         )
         .unwrap();
         let reopened = Session::open(&session.path).unwrap();

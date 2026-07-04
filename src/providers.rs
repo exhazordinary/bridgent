@@ -215,8 +215,7 @@ impl Provider for AnthropicProvider {
         messages: &[Message],
         tools: &[Value],
     ) -> Result<Message, ProviderError> {
-        let body =
-            anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
+        let body = anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
         let response = post(
             &format!("{}/v1/messages", self.base_url),
             &[
@@ -321,7 +320,10 @@ pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
                     let arguments = call["function"]["arguments"].as_str().unwrap_or("{}");
                     ToolCall {
                         id: call["id"].as_str().unwrap_or_default().to_string(),
-                        name: call["function"]["name"].as_str().unwrap_or_default().to_string(),
+                        name: call["function"]["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
                         args: serde_json::from_str(arguments).unwrap_or(json!({})),
                     }
                 })
@@ -369,7 +371,11 @@ mod tests {
             Message::user("hi"),
             Message::assistant(
                 "reading",
-                vec![ToolCall { id: "t1".into(), name: "read".into(), args: json!({"path": "a"}) }],
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    args: json!({"path": "a"}),
+                }],
             ),
             Message::tool_result("t1", "file data", false),
         ]
@@ -411,8 +417,16 @@ mod tests {
             Message::assistant(
                 "",
                 vec![
-                    ToolCall { id: "t1".into(), name: "read".into(), args: json!({"path": "a"}) },
-                    ToolCall { id: "t2".into(), name: "read".into(), args: json!({"path": "b"}) },
+                    ToolCall {
+                        id: "t1".into(),
+                        name: "read".into(),
+                        args: json!({"path": "a"}),
+                    },
+                    ToolCall {
+                        id: "t2".into(),
+                        name: "read".into(),
+                        args: json!({"path": "b"}),
+                    },
                 ],
             ),
             Message::tool_result("t1", "one", false),
@@ -440,7 +454,11 @@ mod tests {
         assert_eq!(reply.content, "reading");
         assert_eq!(
             reply.tool_calls,
-            vec![ToolCall { id: "toolu_1".into(), name: "read".into(), args: json!({"path": "a.txt"}) }]
+            vec![ToolCall {
+                id: "toolu_1".into(),
+                name: "read".into(),
+                args: json!({"path": "a.txt"})
+            }]
         );
     }
 
@@ -483,7 +501,11 @@ mod tests {
         assert_eq!(reply.content, "");
         assert_eq!(
             reply.tool_calls,
-            vec![ToolCall { id: "call_1".into(), name: "read".into(), args: json!({"path": "a.txt"}) }]
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                args: json!({"path": "a.txt"})
+            }]
         );
     }
 

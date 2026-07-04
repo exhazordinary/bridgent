@@ -70,7 +70,11 @@ impl<'a> Agent<'a> {
                 let result = self.tools.run(&call.name, &call.args);
                 on_event(Event::ToolEnd(call, &result));
                 session
-                    .append(Message::tool_result(&call.id, &result.output, result.is_error))
+                    .append(Message::tool_result(
+                        &call.id,
+                        &result.output,
+                        result.is_error,
+                    ))
                     .map_err(|e| ProviderError(format!("cannot persist session: {e}")))?;
             }
         }
@@ -112,7 +116,10 @@ mod tests {
 
     impl ScriptedProvider {
         fn new(script: Vec<Result<Message, ProviderError>>) -> Self {
-            Self { script: RefCell::new(script), calls: RefCell::new(Vec::new()) }
+            Self {
+                script: RefCell::new(script),
+                calls: RefCell::new(Vec::new()),
+            }
         }
     }
 
@@ -161,7 +168,11 @@ mod tests {
         let provider = ScriptedProvider::new(vec![
             Ok(Message::assistant(
                 "reading",
-                vec![ToolCall { id: "t1".into(), name: "read".into(), args: json!({"path": "a.txt"}) }],
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    args: json!({"path": "a.txt"}),
+                }],
             )),
             Ok(Message::assistant("the file says: file contents", vec![])),
         ]);
@@ -193,7 +204,10 @@ mod tests {
         );
         // Second model call must include the tool result.
         let second_call = &provider.calls.borrow()[1];
-        assert_eq!(second_call.last().unwrap().tool_call_id.as_deref(), Some("t1"));
+        assert_eq!(
+            second_call.last().unwrap().tool_call_id.as_deref(),
+            Some("t1")
+        );
     }
 
     #[test]
@@ -203,7 +217,11 @@ mod tests {
         let provider = ScriptedProvider::new(vec![
             Ok(Message::assistant(
                 "",
-                vec![ToolCall { id: "t1".into(), name: "read".into(), args: json!({"path": "ghost.txt"}) }],
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    args: json!({"path": "ghost.txt"}),
+                }],
             )),
             Ok(Message::assistant("that file doesn't exist", vec![])),
         ]);
@@ -227,8 +245,16 @@ mod tests {
             Ok(Message::assistant(
                 "",
                 vec![
-                    ToolCall { id: "t1".into(), name: "read".into(), args: json!({"path": "a.txt"}) },
-                    ToolCall { id: "t2".into(), name: "read".into(), args: json!({"path": "b.txt"}) },
+                    ToolCall {
+                        id: "t1".into(),
+                        name: "read".into(),
+                        args: json!({"path": "a.txt"}),
+                    },
+                    ToolCall {
+                        id: "t2".into(),
+                        name: "read".into(),
+                        args: json!({"path": "b.txt"}),
+                    },
                 ],
             )),
             Ok(Message::assistant("done", vec![])),

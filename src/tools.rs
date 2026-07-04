@@ -20,11 +20,17 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(output: impl Into<String>) -> Self {
-        Self { output: output.into(), is_error: false }
+        Self {
+            output: output.into(),
+            is_error: false,
+        }
     }
 
     pub fn err(output: impl Into<String>) -> Self {
-        Self { output: output.into(), is_error: true }
+        Self {
+            output: output.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -103,7 +109,9 @@ impl ReadTool {
     pub const MAX_LINES: usize = 2000;
 
     pub fn new(workdir: &Path) -> Self {
-        Self { workdir: workdir.to_path_buf() }
+        Self {
+            workdir: workdir.to_path_buf(),
+        }
     }
 }
 
@@ -139,7 +147,11 @@ impl Tool for ReadTool {
             Err(e) => return ToolResult::err(format!("Cannot read {path}: {e}")),
         };
         let lines: Vec<&str> = content.split_inclusive('\n').collect();
-        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -164,7 +176,9 @@ pub struct WriteTool {
 
 impl WriteTool {
     pub fn new(workdir: &Path) -> Self {
-        Self { workdir: workdir.to_path_buf() }
+        Self {
+            workdir: workdir.to_path_buf(),
+        }
     }
 }
 
@@ -212,7 +226,9 @@ pub struct EditTool {
 
 impl EditTool {
     pub fn new(workdir: &Path) -> Self {
-        Self { workdir: workdir.to_path_buf() }
+        Self {
+            workdir: workdir.to_path_buf(),
+        }
     }
 }
 
@@ -244,7 +260,10 @@ impl Tool for EditTool {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let (old, new) = match (required_str(args, "old_string"), required_str(args, "new_string")) {
+        let (old, new) = match (
+            required_str(args, "old_string"),
+            required_str(args, "new_string"),
+        ) {
             (Ok(o), Ok(n)) => (o, n),
             (Err(e), _) | (_, Err(e)) => return e,
         };
@@ -257,7 +276,10 @@ impl Tool for EditTool {
         if count == 0 {
             return ToolResult::err(format!("old_string not found in {path}"));
         }
-        let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if count > 1 && !replace_all {
             return ToolResult::err(format!(
                 "old_string matches {count} locations in {path}; add more context \
@@ -280,7 +302,9 @@ impl BashTool {
     pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
     pub fn new(workdir: &Path) -> Self {
-        Self { workdir: workdir.to_path_buf() }
+        Self {
+            workdir: workdir.to_path_buf(),
+        }
     }
 }
 
@@ -346,10 +370,7 @@ impl Tool for BashTool {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return ToolResult::err(format!(
-                    "Command timed out after {}s",
-                    timeout.as_secs()
-                ));
+                return ToolResult::err(format!("Command timed out after {}s", timeout.as_secs()));
             }
             Err(e) => return ToolResult::err(format!("Failed to wait for command: {e}")),
         };
@@ -444,10 +465,16 @@ mod tests {
         let tool = WriteTool::new(dir.path());
         let result = tool.run(&json!({"path": "a/b/c.txt", "content": "deep"}));
         assert!(!result.is_error);
-        assert_eq!(std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(), "deep");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
+            "deep"
+        );
 
         tool.run(&json!({"path": "a/b/c.txt", "content": "new"}));
-        assert_eq!(std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
@@ -457,7 +484,10 @@ mod tests {
         let result = EditTool::new(dir.path())
             .run(&json!({"path": "f.py", "old_string": "b = 2", "new_string": "b = 3"}));
         assert!(!result.is_error);
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.py")).unwrap(), "a = 1\nb = 3\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.py")).unwrap(),
+            "a = 1\nb = 3\n"
+        );
     }
 
     #[test]
@@ -483,7 +513,10 @@ mod tests {
             &json!({"path": "f.py", "old_string": "x", "new_string": "y", "replace_all": true}),
         );
         assert!(!result.is_error);
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.py")).unwrap(), "y\ny\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.py")).unwrap(),
+            "y\ny\n"
+        );
     }
 
     #[test]
@@ -514,8 +547,7 @@ mod tests {
     #[test]
     fn bash_output_is_capped() {
         let dir = workdir();
-        let result = BashTool::new(dir.path())
-            .run(&json!({"command": "yes | head -c 1000000"}));
+        let result = BashTool::new(dir.path()).run(&json!({"command": "yes | head -c 1000000"}));
         assert!(result.output.len() <= BashTool::MAX_OUTPUT_CHARS + 100);
         assert!(result.output.contains("[truncated]"));
     }

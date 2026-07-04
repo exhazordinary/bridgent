@@ -53,7 +53,11 @@ mod tests {
         let prompt = system_prompt(dir.path());
         assert!(prompt.contains(&dir.path().display().to_string()));
         // The whole point: a lean prompt. Fail loudly if it bloats.
-        assert!(prompt.len() < 1500, "base prompt grew to {} chars", prompt.len());
+        assert!(
+            prompt.len() < 1500,
+            "base prompt grew to {} chars",
+            prompt.len()
+        );
     }
 
     #[test]
