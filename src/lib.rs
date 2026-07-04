@@ -9,5 +9,6 @@ pub mod agent;
 pub mod config;
 pub mod context;
 pub mod providers;
+pub mod refine;
 pub mod session;
 pub mod tools;
