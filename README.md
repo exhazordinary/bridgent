@@ -86,6 +86,21 @@ every provider quirk is unit-tested without a network. The agent loop is
 tested against a scripted mock provider. `cargo test` runs the whole suite in
 about a second.
 
+## Security model
+
+bridle executes what the model asks, including arbitrary shell commands, with
+your permissions and no sandbox — same trust model as every minimal coding
+agent. Two consequences to be aware of:
+
+- **Only run it in repositories you trust.** `AGENTS.md`/`CLAUDE.md` content
+  goes into the system prompt, so a malicious repo can steer the agent
+  (prompt injection → code execution).
+- Untrusted *data* the agent reads (issues, web content piped through bash)
+  can attempt the same. Review what it did — sessions in `.bridle/sessions/`
+  are the full audit log.
+
+If you need containment, run bridle inside a container or VM.
+
 ## Non-goals (for now)
 
 Streaming output, MCP, sub-agents, built-in todo lists, plan modes. Most of
