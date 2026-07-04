@@ -41,9 +41,13 @@ export ANTHROPIC_API_KEY=sk-ant-...
 bridgent "fix the failing test in this repo"   # one-shot
 bridgent                                       # interactive REPL
 bridgent -c                                    # resume the latest session
+bridgent --sessions                            # list sessions in this directory
 ```
 
-Any OpenAI-compatible server works, including local models:
+Responses stream token by token. Inside the REPL, `/help` lists session
+commands: `/new`, `/compact` (summarize old history to reclaim context —
+this also happens automatically as the session grows), and `/usage` (token
+totals). Any OpenAI-compatible server works, including local models:
 
 ```sh
 bridgent --provider openai --base-url http://localhost:11434/v1 --model qwen3 "hi"
@@ -84,7 +88,13 @@ winning program produces the test predictions.
 
 ```sh
 bridgent-arc --rounds 3 --samples 5 task.json   # predictions as JSON on stdout
+bridgent-arc --dir tasks/                       # evaluate a whole benchmark
 ```
+
+Evaluation mode scores every task against its known outputs and prints an
+accuracy report headed by the full harness configuration — because agent
+benchmarks are meaningless when the harness is undisclosed
+([Stop Comparing LLM Agents Without Disclosing the Harness](https://arxiv.org/pdf/2605.23950)).
 
 ## Architecture
 
@@ -92,7 +102,8 @@ bridgent-arc --rounds 3 --samples 5 task.json   # predictions as JSON on stdout
 src/
   tools.rs         Tool trait + registry + read/write/edit/bash
   providers.rs     Provider trait + neutral Message type + Anthropic/OpenAI clients
-  agent.rs         the loop: complete → run tools → feed back → repeat
+  streaming.rs     SSE parsing + per-provider delta accumulators
+  agent.rs         the loop: complete → run tools → feed back → repeat; compaction
   refine.rs        generate–verify–revise engine (evolutionary test-time compute)
   arc.rs           ARC-AGI harness: prompts, python runner, grid verifier
   session.rs       append-only JSONL persistence, resume
@@ -125,9 +136,9 @@ If you need containment, run bridgent inside a container or VM.
 
 ## Non-goals (for now)
 
-Streaming output, MCP, sub-agents, built-in todo lists, plan modes. Most of
-these are better served by bash and files; the rest can land later without
-touching the core.
+MCP, sub-agents, built-in todo lists, plan modes. Most of these are better
+served by bash and files; the rest can land later without touching the core.
+Known limitation: Ctrl-C aborts the whole process, not just the current turn.
 
 ## References
 
