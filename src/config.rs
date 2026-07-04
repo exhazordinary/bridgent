@@ -43,6 +43,9 @@ pub struct Config {
     pub provider: ProviderKind,
     pub model: String,
     pub api_key: String,
+    /// Bearer token (`ANTHROPIC_AUTH_TOKEN`) for gateways and other
+    /// OAuth-issued credentials; takes precedence over the API key.
+    pub auth_token: Option<String>,
     pub base_url: Option<String>,
 }
 
@@ -67,16 +70,27 @@ impl Config {
         let base_url = base_url_flag
             .map(str::to_string)
             .or_else(|| env("BRIDGENT_BASE_URL"));
-        // Local OpenAI-compatible servers (ollama, vllm) don't need a real key.
+        let auth_token = match provider {
+            ProviderKind::Anthropic => env("ANTHROPIC_AUTH_TOKEN"),
+            ProviderKind::OpenAI => None,
+        };
+        // Local OpenAI-compatible servers (ollama, vllm) don't need a real
+        // key, and a bearer token replaces the API key entirely.
         let api_key = match env(provider.key_var()) {
             Some(key) => key,
-            None if base_url.is_some() => String::new(),
-            None => return Err(format!("{} is not set", provider.key_var())),
+            None if base_url.is_some() || auth_token.is_some() => String::new(),
+            None => {
+                return Err(format!(
+                    "{} is not set (for anthropic, ANTHROPIC_AUTH_TOKEN also works)",
+                    provider.key_var()
+                ))
+            }
         };
         Ok(Self {
             provider,
             model,
             api_key,
+            auth_token,
             base_url,
         })
     }
@@ -85,6 +99,7 @@ impl Config {
         match self.provider {
             ProviderKind::Anthropic => {
                 let mut p = AnthropicProvider::new(&self.api_key, &self.model);
+                p.auth_token = self.auth_token.clone();
                 if let Some(url) = &self.base_url {
                     p.base_url = url.clone();
                 }
@@ -164,6 +179,26 @@ mod tests {
             config.base_url.as_deref(),
             Some("http://localhost:11434/v1")
         );
+    }
+
+    #[test]
+    fn bearer_token_replaces_api_key_for_anthropic() {
+        let config = Config::resolve(
+            env_of(&[("ANTHROPIC_AUTH_TOKEN", "oauth-tok")]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.auth_token.as_deref(), Some("oauth-tok"));
+        assert_eq!(config.api_key, "");
+    }
+
+    #[test]
+    fn bearer_token_is_ignored_for_openai() {
+        let env = env_of(&[("ANTHROPIC_AUTH_TOKEN", "tok"), ("OPENAI_API_KEY", "k")]);
+        let config = Config::resolve(env, Some("openai"), None, None).unwrap();
+        assert_eq!(config.auth_token, None);
     }
 
     #[test]

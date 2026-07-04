@@ -60,9 +60,20 @@ bridgent --provider openai --base-url http://localhost:11434/v1 --model qwen3 "h
 | `--provider` | `BRIDGENT_PROVIDER` | `anthropic` |
 | `--model` | `BRIDGENT_MODEL` | per provider |
 | `--base-url` | `BRIDGENT_BASE_URL` | provider default |
-| — | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | required (unless `--base-url` is set) |
+| — | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | required (unless `--base-url` or a bearer token is set) |
+| — | `ANTHROPIC_AUTH_TOKEN` | optional bearer token, replaces the API key |
 
 Flags override env; env overrides defaults.
+
+### A note on Claude subscriptions
+
+A Claude Pro/Max subscription authenticates through OAuth tokens issued for
+Claude Code; Anthropic's terms don't allow third-party harnesses to reuse
+that flow, and tools that did have been blocked. bridgent therefore doesn't
+impersonate Claude Code. It does accept any legitimately issued bearer token
+via `ANTHROPIC_AUTH_TOKEN` (enterprise gateways, LLM proxies), so if
+subscription auth ever opens up to third-party harnesses, bridgent already
+speaks it. For metered API access, use `ANTHROPIC_API_KEY`.
 
 ### Project instructions
 

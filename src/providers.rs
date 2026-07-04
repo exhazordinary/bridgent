@@ -151,7 +151,11 @@ pub trait Provider {
     }
 }
 
-fn send(url: &str, headers: &[(&str, &str)], body: Value) -> Result<ureq::Response, ProviderError> {
+fn send(
+    url: &str,
+    headers: &[(String, String)],
+    body: Value,
+) -> Result<ureq::Response, ProviderError> {
     let mut request = ureq::post(url);
     for (name, value) in headers {
         request = request.set(name, value);
@@ -172,7 +176,7 @@ fn send(url: &str, headers: &[(&str, &str)], body: Value) -> Result<ureq::Respon
     }
 }
 
-fn post(url: &str, headers: &[(&str, &str)], body: Value) -> Result<Value, ProviderError> {
+fn post(url: &str, headers: &[(String, String)], body: Value) -> Result<Value, ProviderError> {
     send(url, headers, body)?
         .into_json()
         .map_err(|e| ProviderError::fatal(format!("invalid JSON response: {e}")))
@@ -192,6 +196,8 @@ fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Option<Usage>
 
 pub struct AnthropicProvider {
     pub api_key: String,
+    /// OAuth/gateway bearer token; used instead of the API key when set.
+    pub auth_token: Option<String>,
     pub model: String,
     pub base_url: String,
     pub max_tokens: u32,
@@ -201,10 +207,20 @@ impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
+            auth_token: None,
             model: model.into(),
             base_url: "https://api.anthropic.com".into(),
             max_tokens: 8192,
         }
+    }
+
+    /// Auth + version headers for every request.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let auth = match &self.auth_token {
+            Some(token) => ("Authorization".into(), format!("Bearer {token}")),
+            None => ("x-api-key".into(), self.api_key.clone()),
+        };
+        vec![auth, ("anthropic-version".into(), "2023-06-01".into())]
     }
 }
 
@@ -302,10 +318,7 @@ impl Provider for AnthropicProvider {
         let body = anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
         let response = post(
             &format!("{}/v1/messages", self.base_url),
-            &[
-                ("x-api-key", &self.api_key),
-                ("anthropic-version", "2023-06-01"),
-            ],
+            &self.headers(),
             body,
         )?;
         anthropic_parse_response(&response)
@@ -323,10 +336,7 @@ impl Provider for AnthropicProvider {
         body["stream"] = Value::Bool(true);
         let response = send(
             &format!("{}/v1/messages", self.base_url),
-            &[
-                ("x-api-key", &self.api_key),
-                ("anthropic-version", "2023-06-01"),
-            ],
+            &self.headers(),
             body,
         )?;
         let mut acc = crate::streaming::AnthropicAccumulator::default();
@@ -464,7 +474,7 @@ impl Provider for OpenAIProvider {
         let body = openai_build_request(&self.model, system, messages, tools);
         let response = post(
             &format!("{}/chat/completions", self.base_url),
-            &[("Authorization", &format!("Bearer {}", self.api_key))],
+            &[("Authorization".into(), format!("Bearer {}", self.api_key))],
             body,
         )?;
         openai_parse_response(&response)
@@ -482,7 +492,7 @@ impl Provider for OpenAIProvider {
         body["stream_options"] = json!({"include_usage": true});
         let response = send(
             &format!("{}/chat/completions", self.base_url),
-            &[("Authorization", &format!("Bearer {}", self.api_key))],
+            &[("Authorization".into(), format!("Bearer {}", self.api_key))],
             body,
         )?;
         let mut acc = crate::streaming::OpenAIAccumulator::default();
@@ -683,6 +693,19 @@ mod tests {
     #[test]
     fn openai_rejects_malformed_response() {
         assert!(openai_parse_response(&json!({"error": "nope"})).is_err());
+    }
+
+    #[test]
+    fn anthropic_headers_prefer_bearer_token() {
+        let mut provider = AnthropicProvider::new("sk-key", "m");
+        assert!(provider
+            .headers()
+            .contains(&("x-api-key".into(), "sk-key".into())));
+
+        provider.auth_token = Some("oauth-tok".into());
+        let headers = provider.headers();
+        assert!(headers.contains(&("Authorization".into(), "Bearer oauth-tok".into())));
+        assert!(!headers.iter().any(|(name, _)| name == "x-api-key"));
     }
 
     #[test]
