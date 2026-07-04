@@ -13,4 +13,5 @@ pub mod process;
 pub mod providers;
 pub mod refine;
 pub mod session;
+pub mod streaming;
 pub mod tools;

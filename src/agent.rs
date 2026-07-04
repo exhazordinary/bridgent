@@ -17,6 +17,9 @@ fn history_chars(messages: &[Message]) -> usize {
 
 /// Progress notifications emitted while a turn runs, for the UI layer.
 pub enum Event<'a> {
+    /// A streamed chunk of assistant text, in arrival order.
+    AssistantDelta(&'a str),
+    /// The complete assistant text once the message finishes.
     AssistantText(&'a str),
     ToolStart(&'a ToolCall),
     ToolEnd(&'a ToolCall, &'a ToolResult),
@@ -75,7 +78,7 @@ impl<'a> Agent<'a> {
         }
         loop {
             let schemas = self.tools.schemas();
-            let reply = self.complete_with_retry(&session.messages, &schemas)?;
+            let reply = self.complete_with_retry(&session.messages, &schemas, &mut on_event)?;
             if !reply.content.is_empty() {
                 on_event(Event::AssistantText(&reply.content));
             }
@@ -144,6 +147,7 @@ impl<'a> Agent<'a> {
         &self,
         messages: &[Message],
         tools: &[serde_json::Value],
+        on_event: &mut impl FnMut(Event),
     ) -> Result<Message, ProviderError> {
         let mut delay = self.retry_delay;
         let mut last_error = ProviderError::fatal("no attempts made");
@@ -152,11 +156,19 @@ impl<'a> Agent<'a> {
                 std::thread::sleep(delay);
                 delay *= 2;
             }
-            match self.provider.complete(&self.system, messages, tools) {
+            let mut emitted = false;
+            let result =
+                self.provider
+                    .complete_stream(&self.system, messages, tools, &mut |text| {
+                        emitted = true;
+                        on_event(Event::AssistantDelta(text));
+                    });
+            match result {
                 Ok(reply) => return Ok(reply),
-                // Retrying a fatal error (bad request, auth) wastes time
-                // and money; only transient failures get another attempt.
-                Err(e) if !e.retryable => return Err(e),
+                // Retrying a fatal error (bad request, auth) wastes time and
+                // money, and retrying after text reached the user would
+                // duplicate output. Only clean transient failures try again.
+                Err(e) if !e.retryable || emitted => return Err(e),
                 Err(e) => last_error = e,
             }
         }
@@ -245,6 +257,7 @@ mod tests {
         let answer = agent_fixture(&provider, &tools)
             .run_turn(&mut session, "read a.txt", |event| {
                 events.push(match event {
+                    Event::AssistantDelta(t) => format!("delta:{t}"),
                     Event::AssistantText(t) => format!("text:{t}"),
                     Event::ToolStart(c) => format!("start:{}", c.name),
                     Event::ToolEnd(c, r) => format!("end:{}:{}", c.name, r.output),
@@ -257,12 +270,15 @@ mod tests {
         // user, assistant(tool call), tool result, assistant(final)
         assert_eq!(session.messages.len(), 4);
         assert_eq!(session.messages[2].content, "file contents");
+        // Non-streaming providers emit one delta with the full text.
         assert_eq!(
             events,
             vec![
+                "delta:reading",
                 "text:reading",
                 "start:read",
                 "end:read:file contents",
+                "delta:the file says: file contents",
                 "text:the file says: file contents",
             ]
         );

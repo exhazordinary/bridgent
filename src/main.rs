@@ -86,6 +86,10 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
 /// Render agent progress to stderr so stdout stays clean for the answer.
 fn print_event(event: Event) {
     match event {
+        Event::AssistantDelta(text) => {
+            print!("{text}");
+            std::io::stdout().flush().ok();
+        }
         Event::AssistantText(_) => {}
         Event::ToolStart(call) => {
             let args = serde_json::to_string(&call.args).unwrap_or_default();
@@ -162,10 +166,11 @@ fn run() -> Result<(), String> {
     };
 
     if let Some(prompt) = args.prompt {
-        let answer = agent
+        // The answer streams through print_event; just terminate the line.
+        agent
             .run_turn(&mut session, &prompt, print_event)
             .map_err(|e| e.to_string())?;
-        println!("{answer}");
+        println!();
         return Ok(());
     }
 
@@ -201,7 +206,7 @@ fn run() -> Result<(), String> {
             continue;
         }
         match agent.run_turn(&mut session, input, print_event) {
-            Ok(answer) => println!("{answer}\n"),
+            Ok(_) => println!("\n"), // answer already streamed
             // Provider errors don't kill the REPL; the session file is intact.
             Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
         }

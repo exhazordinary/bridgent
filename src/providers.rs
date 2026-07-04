@@ -132,17 +132,32 @@ pub trait Provider {
         messages: &[Message],
         tools: &[Value],
     ) -> Result<Message, ProviderError>;
+
+    /// Like `complete`, but emits text chunks through `on_text` as they
+    /// arrive. The default falls back to one chunk after the full response —
+    /// mocks and future providers work unchanged.
+    fn complete_stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Value],
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Message, ProviderError> {
+        let message = self.complete(system, messages, tools)?;
+        if !message.content.is_empty() {
+            on_text(&message.content);
+        }
+        Ok(message)
+    }
 }
 
-fn post(url: &str, headers: &[(&str, &str)], body: Value) -> Result<Value, ProviderError> {
+fn send(url: &str, headers: &[(&str, &str)], body: Value) -> Result<ureq::Response, ProviderError> {
     let mut request = ureq::post(url);
     for (name, value) in headers {
         request = request.set(name, value);
     }
     match request.send_json(body) {
-        Ok(response) => response
-            .into_json()
-            .map_err(|e| ProviderError::fatal(format!("invalid JSON response: {e}"))),
+        Ok(response) => Ok(response),
         Err(ureq::Error::Status(code, response)) => {
             let detail = response.into_string().unwrap_or_default();
             let message = format!("HTTP {code}: {detail}");
@@ -155,6 +170,12 @@ fn post(url: &str, headers: &[(&str, &str)], body: Value) -> Result<Value, Provi
         // Transport-level failures (DNS, refused, reset) are worth retrying.
         Err(e) => Err(ProviderError::transient(e.to_string())),
     }
+}
+
+fn post(url: &str, headers: &[(&str, &str)], body: Value) -> Result<Value, ProviderError> {
+    send(url, headers, body)?
+        .into_json()
+        .map_err(|e| ProviderError::fatal(format!("invalid JSON response: {e}")))
 }
 
 fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Option<Usage> {
@@ -289,6 +310,39 @@ impl Provider for AnthropicProvider {
         )?;
         anthropic_parse_response(&response)
     }
+
+    fn complete_stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Value],
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Message, ProviderError> {
+        let mut body =
+            anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
+        body["stream"] = Value::Bool(true);
+        let response = send(
+            &format!("{}/v1/messages", self.base_url),
+            &[
+                ("x-api-key", &self.api_key),
+                ("anthropic-version", "2023-06-01"),
+            ],
+            body,
+        )?;
+        let mut acc = crate::streaming::AnthropicAccumulator::default();
+        crate::streaming::each_sse_data(std::io::BufReader::new(response.into_reader()), |data| {
+            let event: Value = serde_json::from_str(data)
+                .map_err(|e| ProviderError::fatal(format!("invalid stream event: {e}")))?;
+            if event["type"] == "error" {
+                return Err(ProviderError::transient(
+                    event["error"]["message"].to_string(),
+                ));
+            }
+            acc.handle(&event, &mut *on_text);
+            Ok(())
+        })?;
+        Ok(acc.finish())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +468,31 @@ impl Provider for OpenAIProvider {
             body,
         )?;
         openai_parse_response(&response)
+    }
+
+    fn complete_stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Value],
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Message, ProviderError> {
+        let mut body = openai_build_request(&self.model, system, messages, tools);
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = json!({"include_usage": true});
+        let response = send(
+            &format!("{}/chat/completions", self.base_url),
+            &[("Authorization", &format!("Bearer {}", self.api_key))],
+            body,
+        )?;
+        let mut acc = crate::streaming::OpenAIAccumulator::default();
+        crate::streaming::each_sse_data(std::io::BufReader::new(response.into_reader()), |data| {
+            let chunk: Value = serde_json::from_str(data)
+                .map_err(|e| ProviderError::fatal(format!("invalid stream chunk: {e}")))?;
+            acc.handle(&chunk, &mut *on_text);
+            Ok(())
+        })?;
+        Ok(acc.finish())
     }
 }
 
