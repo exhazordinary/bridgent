@@ -1,6 +1,6 @@
 //! Persistent sessions: append-only JSONL, one message per line.
 //!
-//! Sessions live in `.bridle/sessions/` under the working directory. The
+//! Sessions live in `.bridgent/sessions/` under the working directory. The
 //! format is trivially greppable and survives crashes — every message is
 //! flushed as soon as it is appended.
 
@@ -17,7 +17,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Start a fresh session under `workdir/.bridle/sessions/`.
+    /// Start a fresh session under `workdir/.bridgent/sessions/`.
     pub fn create(workdir: &Path) -> std::io::Result<Self> {
         let dir = sessions_dir(workdir);
         fs::create_dir_all(&dir)?;
@@ -72,7 +72,7 @@ impl Session {
 }
 
 fn sessions_dir(workdir: &Path) -> PathBuf {
-    workdir.join(".bridle").join("sessions")
+    workdir.join(".bridgent").join("sessions")
 }
 
 #[cfg(test)]

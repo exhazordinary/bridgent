@@ -1,13 +1,10 @@
-# bridle
+# bridgent
 
 A minimal, provider-agnostic coding agent harness in Rust. Single static
 binary, four tools, no bloat.
 
 > An agent is a model plus a harness. The model is rented; the harness is
 > yours. This is the harness.
-
-*(Working name — a bridle is part of a horse harness. Rename with one line in
-`Cargo.toml`.)*
 
 ## Why
 
@@ -25,9 +22,9 @@ Built on the converging lessons of harness-engineering research and practice:
   verbatim so it can correct course; transient provider errors retry with
   backoff. *(Anthropic, "Effective harnesses for long-running agents")*
 - **State lives in files.** Sessions are append-only JSONL in
-  `.bridle/sessions/` — crash-safe, greppable, resumable. *(hermes)*
-- **Core is separate from frontend.** The library (`bridle::agent`,
-  `bridle::tools`, `bridle::providers`, `bridle::session`) has no CLI
+  `.bridgent/sessions/` — crash-safe, greppable, resumable. *(hermes)*
+- **Core is separate from frontend.** The library (`bridgent::agent`,
+  `bridgent::tools`, `bridgent::providers`, `bridgent::session`) has no CLI
   dependency; the binary is a thin client. *(opencode)*
 
 ## Install
@@ -41,24 +38,24 @@ cargo install --path .
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...
 
-bridle "fix the failing test in this repo"   # one-shot
-bridle                                       # interactive REPL
-bridle -c                                    # resume the latest session
+bridgent "fix the failing test in this repo"   # one-shot
+bridgent                                       # interactive REPL
+bridgent -c                                    # resume the latest session
 ```
 
 Any OpenAI-compatible server works, including local models:
 
 ```sh
-bridle --provider openai --base-url http://localhost:11434/v1 --model qwen3 "hi"
+bridgent --provider openai --base-url http://localhost:11434/v1 --model qwen3 "hi"
 ```
 
 ### Configuration
 
 | Flag | Env var | Default |
 |---|---|---|
-| `--provider` | `BRIDLE_PROVIDER` | `anthropic` |
-| `--model` | `BRIDLE_MODEL` | per provider |
-| `--base-url` | `BRIDLE_BASE_URL` | provider default |
+| `--provider` | `BRIDGENT_PROVIDER` | `anthropic` |
+| `--model` | `BRIDGENT_MODEL` | per provider |
+| `--base-url` | `BRIDGENT_BASE_URL` | provider default |
 | — | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | required (unless `--base-url` is set) |
 
 Flags override env; env overrides defaults.
@@ -68,9 +65,9 @@ Flags override env; env overrides defaults.
 Put an `AGENTS.md` (or `CLAUDE.md`) in your working directory and its content
 is appended to the system prompt. That's the whole customization model.
 
-## The refine engine and `bridle-arc`
+## The refine engine and `bridgent-arc`
 
-Beyond the interactive agent, bridle ships the other fundamental harness
+Beyond the interactive agent, bridgent ships the other fundamental harness
 pattern: **generate → verify → revise**. The `refine` module samples
 candidates from the model, scores them with a deterministic verifier, and
 feeds scores plus failure diffs back so the model evolves its best attempts
@@ -80,13 +77,13 @@ Berman's evolutionary test-time compute,
 [Pang's evolutionary program synthesis](https://ctpang.substack.com/p/arc-agi-2-sota-efficient-evolutionary)),
 generalized to anything with a verifier.
 
-`bridle-arc` applies it to ARC-AGI tasks: the model writes Python
-`transform` programs, bridle executes them against the task's training
+`bridgent-arc` applies it to ARC-AGI tasks: the model writes Python
+`transform` programs, bridgent executes them against the task's training
 pairs, failures come back as exact expected-vs-got grid diffs, and the
 winning program produces the test predictions.
 
 ```sh
-bridle-arc --rounds 3 --samples 5 task.json   # predictions as JSON on stdout
+bridgent-arc --rounds 3 --samples 5 task.json   # predictions as JSON on stdout
 ```
 
 ## Architecture
@@ -102,8 +99,8 @@ src/
   context.rs       system prompt builder (base + AGENTS.md)
   process.rs       shared subprocess runner (timeout, deadlock-safe)
   config.rs        env + flag resolution
-  main.rs          bridle CLI
-  bin/bridle-arc.rs  ARC solver CLI
+  main.rs          bridgent CLI
+  bin/bridgent-arc.rs  ARC solver CLI
 ```
 
 Request building and response parsing are pure functions over JSON values, so
@@ -113,7 +110,7 @@ about a second.
 
 ## Security model
 
-bridle executes what the model asks, including arbitrary shell commands, with
+bridgent executes what the model asks, including arbitrary shell commands, with
 your permissions and no sandbox — same trust model as every minimal coding
 agent. Two consequences to be aware of:
 
@@ -121,10 +118,10 @@ agent. Two consequences to be aware of:
   goes into the system prompt, so a malicious repo can steer the agent
   (prompt injection → code execution).
 - Untrusted *data* the agent reads (issues, web content piped through bash)
-  can attempt the same. Review what it did — sessions in `.bridle/sessions/`
+  can attempt the same. Review what it did — sessions in `.bridgent/sessions/`
   are the full audit log.
 
-If you need containment, run bridle inside a container or VM.
+If you need containment, run bridgent inside a container or VM.
 
 ## Non-goals (for now)
 

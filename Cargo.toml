@@ -1,5 +1,5 @@
 [package]
-name = "bridle"
+name = "bridgent"
 version = "0.1.0"
 edition = "2021"
 description = "A minimal, provider-agnostic coding agent harness"

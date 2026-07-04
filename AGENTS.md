@@ -1,4 +1,4 @@
-# bridle — agent instructions
+# bridgent — agent instructions
 
 - Run `cargo test` before claiming any change works; run `cargo fmt` and
   `cargo clippy --all-targets` before committing.

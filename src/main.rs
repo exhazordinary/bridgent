@@ -1,21 +1,21 @@
-//! bridle CLI: one-shot prompts, an interactive REPL, and session resume.
+//! bridgent CLI: one-shot prompts, an interactive REPL, and session resume.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bridle::agent::{Agent, Event};
-use bridle::config::Config;
-use bridle::context::system_prompt;
-use bridle::session::Session;
-use bridle::tools::default_registry;
+use bridgent::agent::{Agent, Event};
+use bridgent::config::Config;
+use bridgent::context::system_prompt;
+use bridgent::session::Session;
+use bridgent::tools::default_registry;
 
 const USAGE: &str = "\
-bridle — a minimal, provider-agnostic coding agent
+bridgent — a minimal, provider-agnostic coding agent
 
 Usage:
-  bridle [OPTIONS]              interactive session in the current directory
-  bridle [OPTIONS] <PROMPT>     run one prompt, print the answer, exit
+  bridgent [OPTIONS]              interactive session in the current directory
+  bridgent [OPTIONS] <PROMPT>     run one prompt, print the answer, exit
 
 Options:
   -c, --continue          resume the most recent session
@@ -27,7 +27,7 @@ Options:
 
 Environment:
   ANTHROPIC_API_KEY / OPENAI_API_KEY   provider credentials
-  BRIDLE_PROVIDER, BRIDLE_MODEL, BRIDLE_BASE_URL   defaults for the flags";
+  BRIDGENT_PROVIDER, BRIDGENT_MODEL, BRIDGENT_BASE_URL   defaults for the flags";
 
 struct Args {
     prompt: Option<String>,
@@ -59,7 +59,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("bridle {}", env!("CARGO_PKG_VERSION"));
+                println!("bridgent {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-c" | "--continue" => args.resume = true,
@@ -133,7 +133,7 @@ fn run() -> Result<(), String> {
     }
 
     eprintln!(
-        "bridle {} · {} · {}",
+        "bridgent {} · {} · {}",
         env!("CARGO_PKG_VERSION"),
         config.model,
         workdir.display()
@@ -168,7 +168,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("bridle: {message}");
+            eprintln!("bridgent: {message}");
             ExitCode::FAILURE
         }
     }

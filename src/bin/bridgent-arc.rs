@@ -1,18 +1,18 @@
-//! bridle-arc: solve an ARC-AGI task by evolving Python programs.
+//! bridgent-arc: solve an ARC-AGI task by evolving Python programs.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bridle::arc::{load_task, solve};
-use bridle::config::Config;
-use bridle::refine::{RefineConfig, RefineEvent};
+use bridgent::arc::{load_task, solve};
+use bridgent::config::Config;
+use bridgent::refine::{RefineConfig, RefineEvent};
 
 const USAGE: &str = "\
-bridle-arc — ARC-AGI solver: evolve Python programs against a task's
+bridgent-arc — ARC-AGI solver: evolve Python programs against a task's
 training pairs, apply the winner to the test inputs.
 
 Usage:
-  bridle-arc [OPTIONS] <task.json>
+  bridgent-arc [OPTIONS] <task.json>
 
 Options:
       --rounds <N>        evolution rounds (default 3)
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("bridle-arc: {message}");
+            eprintln!("bridgent-arc: {message}");
             ExitCode::FAILURE
         }
     }

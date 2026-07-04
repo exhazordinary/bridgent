@@ -102,7 +102,7 @@ impl PythonRunner {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("bridle-arc-{}-{serial}.py", std::process::id()));
+        let path = dir.join(format!("bridgent-arc-{}-{serial}.py", std::process::id()));
         std::fs::write(&path, &program).map_err(|e| format!("cannot write program: {e}"))?;
         let stdin = serde_json::to_vec(&json!(inputs)).expect("grids serialize");
         let result = run_with_timeout(

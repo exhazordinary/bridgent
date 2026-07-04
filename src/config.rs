@@ -1,7 +1,7 @@
 //! Configuration from environment variables and CLI flags.
 //!
-//! Env vars: `BRIDLE_PROVIDER` (anthropic | openai), `BRIDLE_MODEL`,
-//! `BRIDLE_BASE_URL`, and the provider key (`ANTHROPIC_API_KEY` or
+//! Env vars: `BRIDGENT_PROVIDER` (anthropic | openai), `BRIDGENT_MODEL`,
+//! `BRIDGENT_BASE_URL`, and the provider key (`ANTHROPIC_API_KEY` or
 //! `OPENAI_API_KEY`). Flags override env; env overrides defaults.
 
 use crate::providers::{AnthropicProvider, OpenAIProvider, Provider};
@@ -57,16 +57,16 @@ impl Config {
     ) -> Result<Self, String> {
         let provider_name = provider_flag
             .map(str::to_string)
-            .or_else(|| env("BRIDLE_PROVIDER"))
+            .or_else(|| env("BRIDGENT_PROVIDER"))
             .unwrap_or_else(|| "anthropic".into());
         let provider = ProviderKind::parse(&provider_name)?;
         let model = model_flag
             .map(str::to_string)
-            .or_else(|| env("BRIDLE_MODEL"))
+            .or_else(|| env("BRIDGENT_MODEL"))
             .unwrap_or_else(|| provider.default_model().into());
         let base_url = base_url_flag
             .map(str::to_string)
-            .or_else(|| env("BRIDLE_BASE_URL"));
+            .or_else(|| env("BRIDGENT_BASE_URL"));
         // Local OpenAI-compatible servers (ollama, vllm) don't need a real key.
         let api_key = match env(provider.key_var()) {
             Some(key) => key,
@@ -133,8 +133,8 @@ mod tests {
     #[test]
     fn flags_override_env() {
         let env = env_of(&[
-            ("BRIDLE_PROVIDER", "anthropic"),
-            ("BRIDLE_MODEL", "env-model"),
+            ("BRIDGENT_PROVIDER", "anthropic"),
+            ("BRIDGENT_MODEL", "env-model"),
             ("OPENAI_API_KEY", "sk-oai"),
         ]);
         let config = Config::resolve(env, Some("openai"), Some("flag-model"), None).unwrap();
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn openai_env_provider_gets_openai_default_model() {
-        let env = env_of(&[("BRIDLE_PROVIDER", "openai"), ("OPENAI_API_KEY", "k")]);
+        let env = env_of(&[("BRIDGENT_PROVIDER", "openai"), ("OPENAI_API_KEY", "k")]);
         let config = Config::resolve(env, None, None, None).unwrap();
         assert_eq!(config.model, "gpt-5.2");
     }
