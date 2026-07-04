@@ -121,7 +121,7 @@ fn print_progress(event: RefineEvent) {
 
 fn solve_one(
     provider: &dyn Provider,
-    path: &PathBuf,
+    path: &std::path::Path,
     refine: RefineConfig,
 ) -> Result<(ArcTask, Solution), String> {
     let task = load_task(path)?;
