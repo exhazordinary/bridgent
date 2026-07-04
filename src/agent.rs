@@ -7,7 +7,11 @@
 
 use std::time::Duration;
 
-use crate::providers::{Message, Provider, ProviderError, ToolCall};
+use crate::providers::{Message, Provider, ProviderError, Role, ToolCall};
+
+fn history_chars(messages: &[Message]) -> usize {
+    messages.iter().map(|m| m.content.len()).sum()
+}
 use crate::session::Session;
 use crate::tools::{ToolRegistry, ToolResult};
 
@@ -16,6 +20,10 @@ pub enum Event<'a> {
     AssistantText(&'a str),
     ToolStart(&'a ToolCall),
     ToolEnd(&'a ToolCall, &'a ToolResult),
+    /// History was summarized down to `kept` messages before this turn.
+    Compacted {
+        kept: usize,
+    },
 }
 
 pub struct Agent<'a> {
@@ -26,9 +34,15 @@ pub struct Agent<'a> {
     pub max_attempts: u32,
     /// Base delay between retries; doubles each attempt.
     pub retry_delay: Duration,
+    /// Auto-compact when history exceeds this many characters
+    /// (a proxy for tokens at roughly 4 chars each).
+    pub compact_threshold_chars: usize,
 }
 
 impl<'a> Agent<'a> {
+    /// Recent messages preserved verbatim through compaction.
+    const KEEP_RECENT: usize = 10;
+
     pub fn new(provider: &'a dyn Provider, tools: &'a ToolRegistry, system: String) -> Self {
         Self {
             provider,
@@ -36,6 +50,7 @@ impl<'a> Agent<'a> {
             system,
             max_attempts: 3,
             retry_delay: Duration::from_secs(1),
+            compact_threshold_chars: 400_000, // ~100k tokens
         }
     }
 
@@ -51,6 +66,13 @@ impl<'a> Agent<'a> {
         session
             .append(Message::user(user_input))
             .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
+        if history_chars(&session.messages) > self.compact_threshold_chars
+            && self.compact(session)?
+        {
+            on_event(Event::Compacted {
+                kept: session.messages.len(),
+            });
+        }
         loop {
             let schemas = self.tools.schemas();
             let reply = self.complete_with_retry(&session.messages, &schemas)?;
@@ -78,6 +100,44 @@ impl<'a> Agent<'a> {
                     .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
             }
         }
+    }
+
+    /// Summarize everything but the most recent messages into one compact
+    /// user message. Compaction alone loses detail, so the summary prompt
+    /// asks for the state an agent needs to resume: goal, done, pending,
+    /// files touched. Returns false when there is nothing worth compacting.
+    pub fn compact(&self, session: &mut Session) -> Result<bool, ProviderError> {
+        let mut split = session.messages.len().saturating_sub(Self::KEEP_RECENT);
+        // Never orphan a tool result from the assistant message that
+        // requested it: extend the kept window backwards across tool results.
+        while split > 0 && session.messages[split].role == Role::Tool {
+            split -= 1;
+        }
+        if split == 0 {
+            return Ok(false);
+        }
+        let transcript: String = session.messages[..split]
+            .iter()
+            .map(|m| format!("[{:?}] {}\n", m.role, m.content))
+            .collect();
+        let prompt = format!(
+            "Summarize this agent conversation so a fresh agent can resume \
+             seamlessly. State: the user's goal, what has been done, what is \
+             pending, files and commands involved, and any hard constraints. \
+             Be dense and factual.\n\n{transcript}"
+        );
+        let summary = self
+            .provider
+            .complete(&self.system, &[Message::user(prompt)], &[])?;
+        let mut messages = vec![Message::user(format!(
+            "[Earlier conversation compacted. Summary:]\n{}",
+            summary.content
+        ))];
+        messages.extend_from_slice(&session.messages[split..]);
+        session
+            .replace(messages)
+            .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
+        Ok(true)
     }
 
     fn complete_with_retry(
@@ -188,6 +248,7 @@ mod tests {
                     Event::AssistantText(t) => format!("text:{t}"),
                     Event::ToolStart(c) => format!("start:{}", c.name),
                     Event::ToolEnd(c, r) => format!("end:{}:{}", c.name, r.output),
+                    Event::Compacted { kept } => format!("compacted:{kept}"),
                 });
             })
             .unwrap();
@@ -270,6 +331,122 @@ mod tests {
 
         assert_eq!(session.messages[2].content, "aaa");
         assert_eq!(session.messages[3].content, "bbb");
+    }
+
+    #[test]
+    fn compact_summarizes_old_history_and_keeps_recent_messages() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![Ok(Message::assistant(
+            "the goal is X; done: Y",
+            vec![],
+        ))]);
+        let mut session = Session::create(dir.path()).unwrap();
+        for i in 0..15 {
+            session.append(Message::user(format!("msg {i}"))).unwrap();
+        }
+
+        let compacted = agent_fixture(&provider, &tools)
+            .compact(&mut session)
+            .unwrap();
+
+        assert!(compacted);
+        assert_eq!(session.messages.len(), 11); // summary + 10 recent
+        assert!(session.messages[0].content.contains("the goal is X"));
+        assert_eq!(session.messages[1].content, "msg 5");
+        // The summarization request saw the old messages.
+        let prompt = &provider.calls.borrow()[0][0].content;
+        assert!(prompt.contains("msg 0"));
+        // Compaction persists: reopening yields the compacted history.
+        assert_eq!(Session::open(&session.path).unwrap().messages.len(), 11);
+    }
+
+    #[test]
+    fn compact_never_orphans_tool_results() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![Ok(Message::assistant("summary", vec![]))]);
+        let mut session = Session::create(dir.path()).unwrap();
+        for i in 0..4 {
+            session.append(Message::user(format!("msg {i}"))).unwrap();
+        }
+        // An assistant tool call whose results would sit exactly on the
+        // 10-message boundary.
+        session
+            .append(Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    args: json!({}),
+                }],
+            ))
+            .unwrap();
+        session
+            .append(Message::tool_result("t1", "data", false))
+            .unwrap();
+        for i in 0..9 {
+            session
+                .append(Message::user(format!("recent {i}")))
+                .unwrap();
+        }
+        assert_eq!(session.messages.len(), 15);
+        // messages[5] (len-10) is the tool result; a naive split would
+        // orphan it from its assistant call at messages[4].
+        agent_fixture(&provider, &tools)
+            .compact(&mut session)
+            .unwrap();
+        let first_kept = &session.messages[1];
+        assert_eq!(first_kept.tool_calls.len(), 1); // the assistant call survives
+        assert_eq!(session.messages[2].tool_call_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn compact_declines_short_histories() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![]);
+        let mut session = Session::create(dir.path()).unwrap();
+        session.append(Message::user("only one")).unwrap();
+
+        let compacted = agent_fixture(&provider, &tools)
+            .compact(&mut session)
+            .unwrap();
+        assert!(!compacted);
+        assert_eq!(provider.calls.borrow().len(), 0);
+    }
+
+    #[test]
+    fn run_turn_auto_compacts_over_the_threshold() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![
+            Ok(Message::assistant("summary of it all", vec![])),
+            Ok(Message::assistant("answer", vec![])),
+        ]);
+        let mut session = Session::create(dir.path()).unwrap();
+        for i in 0..20 {
+            session
+                .append(Message::user(format!("padding message {i}")))
+                .unwrap();
+        }
+
+        let mut agent = agent_fixture(&provider, &tools);
+        agent.compact_threshold_chars = 100; // force compaction
+        let mut compaction_events = 0;
+        let answer = agent
+            .run_turn(&mut session, "next task", |event| {
+                if matches!(event, Event::Compacted { .. }) {
+                    compaction_events += 1;
+                }
+            })
+            .unwrap();
+
+        assert_eq!(answer, "answer");
+        assert_eq!(compaction_events, 1);
+        assert!(session.messages[0].content.contains("summary of it all"));
+        // The answer's model call ran on the compacted history.
+        assert!(provider.calls.borrow()[1].len() < 15);
     }
 
     #[test]

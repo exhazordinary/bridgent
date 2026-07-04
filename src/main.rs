@@ -94,6 +94,9 @@ fn print_event(event: Event) {
             eprintln!("\x1b[2m  ↳ error: {first}\x1b[0m");
         }
         Event::ToolEnd(..) => {}
+        Event::Compacted { kept } => {
+            eprintln!("\x1b[2m⊜ history compacted to {kept} messages\x1b[0m");
+        }
     }
 }
 

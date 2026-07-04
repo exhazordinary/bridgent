@@ -69,6 +69,21 @@ impl Session {
         self.messages.push(message);
         Ok(())
     }
+
+    /// Replace the whole history (e.g. after compaction). The file is
+    /// rewritten atomically via a temp file so a crash can't lose the session.
+    pub fn replace(&mut self, messages: Vec<Message>) -> std::io::Result<()> {
+        let tmp = self.path.with_extension("jsonl.tmp");
+        let mut buf = Vec::new();
+        for message in &messages {
+            serde_json::to_writer(&mut buf, message)?;
+            buf.push(b'\n');
+        }
+        fs::write(&tmp, &buf)?;
+        fs::rename(&tmp, &self.path)?;
+        self.messages = messages;
+        Ok(())
+    }
 }
 
 fn sessions_dir(workdir: &Path) -> PathBuf {
@@ -121,6 +136,24 @@ mod tests {
         .unwrap();
         let reopened = Session::open(&session.path).unwrap();
         assert_eq!(reopened.messages.len(), 1);
+    }
+
+    #[test]
+    fn replace_rewrites_file_and_memory() {
+        let dir = TempDir::new().unwrap();
+        let mut session = Session::create(dir.path()).unwrap();
+        session.append(Message::user("one")).unwrap();
+        session.append(Message::user("two")).unwrap();
+
+        session.replace(vec![Message::user("summary")]).unwrap();
+        assert_eq!(session.messages.len(), 1);
+
+        let reopened = Session::open(&session.path).unwrap();
+        assert_eq!(reopened.messages.len(), 1);
+        assert_eq!(reopened.messages[0].content, "summary");
+        // Appending after a replace keeps working.
+        session.append(Message::user("three")).unwrap();
+        assert_eq!(Session::open(&session.path).unwrap().messages.len(), 2);
     }
 
     #[test]
