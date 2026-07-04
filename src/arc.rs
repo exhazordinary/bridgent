@@ -191,6 +191,19 @@ impl Verifier for TrainVerifier<'_> {
     }
 }
 
+/// Compare predictions against the task's known test outputs. `None` when
+/// the task ships without published outputs (hidden evaluation).
+pub fn score_predictions(task: &ArcTask, predictions: &[Grid]) -> Option<bool> {
+    let expected: Vec<&Grid> = task.test.iter().filter_map(|p| p.output.as_ref()).collect();
+    if expected.len() != task.test.len() {
+        return None;
+    }
+    Some(
+        predictions.len() == expected.len()
+            && expected.iter().zip(predictions).all(|(e, g)| *e == g),
+    )
+}
+
 pub struct Solution {
     /// Predicted output grids, one per test input.
     pub predictions: Vec<Grid>,
@@ -334,6 +347,23 @@ mod tests {
         let crash = verifier.verify("not python at all");
         assert_eq!(crash.score, 0.0);
         assert!(crash.feedback.contains("crashed") || crash.feedback.contains("invalid"));
+    }
+
+    #[test]
+    fn score_predictions_checks_known_outputs() {
+        let task: ArcTask = serde_json::from_value(json!({
+            "train": [{"input": [[1]], "output": [[1]]}],
+            "test": [{"input": [[2]], "output": [[2]]}],
+        }))
+        .unwrap();
+        assert_eq!(score_predictions(&task, &[vec![vec![2]]]), Some(true));
+        assert_eq!(score_predictions(&task, &[vec![vec![9]]]), Some(false));
+        assert_eq!(score_predictions(&task, &[]), Some(false));
+        // Hidden outputs: nothing to score against.
+        assert_eq!(
+            score_predictions(&identity_task(), &[vec![vec![7, 8]]]),
+            None
+        );
     }
 
     struct ScriptedProvider(RefCell<Vec<String>>);
