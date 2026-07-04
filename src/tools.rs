@@ -9,7 +9,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use wait_timeout::ChildExt;
+
+use crate::process::run_with_timeout;
 
 /// Outcome of a tool invocation, fed back to the model verbatim.
 #[derive(Debug, Clone, PartialEq)]
@@ -340,42 +341,17 @@ impl Tool for BashTool {
                 .and_then(Value::as_u64)
                 .unwrap_or(Self::DEFAULT_TIMEOUT_SECS),
         );
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.workdir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .stdin(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err(format!("Cannot spawn command: {e}")),
+        let result = run_with_timeout(
+            Command::new("sh").arg("-c").arg(command).current_dir(&self.workdir),
+            None,
+            timeout,
+        );
+        let process = match result {
+            Ok(process) => process,
+            Err(e) => return ToolResult::err(e.to_string()),
         };
-        // Drain pipes on background threads so commands producing more than
-        // the OS pipe buffer can't deadlock against wait_timeout below.
-        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut buf = String::new();
-                if let Some(mut pipe) = pipe {
-                    let _ = pipe.read_to_string(&mut buf);
-                }
-                buf
-            })
-        };
-        let stdout_thread = drain(child.stdout.take().map(|p| Box::new(p) as _));
-        let stderr_thread = drain(child.stderr.take().map(|p| Box::new(p) as _));
-        let status = match child.wait_timeout(timeout) {
-            Ok(Some(status)) => status,
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return ToolResult::err(format!("Command timed out after {}s", timeout.as_secs()));
-            }
-            Err(e) => return ToolResult::err(format!("Failed to wait for command: {e}")),
-        };
-        let mut output = stdout_thread.join().unwrap_or_default();
-        output.push_str(&stderr_thread.join().unwrap_or_default());
+        let mut output = process.stdout;
+        output.push_str(&process.stderr);
         if output.len() > Self::MAX_OUTPUT_CHARS {
             let mut end = Self::MAX_OUTPUT_CHARS;
             while !output.is_char_boundary(end) {
@@ -387,7 +363,7 @@ impl Tool for BashTool {
         if output.is_empty() {
             output.push_str("[no output]");
         }
-        match status.code() {
+        match process.exit_code {
             Some(0) => ToolResult::ok(output),
             code => ToolResult::err(format!(
                 "{output}\n[exit code {}]",
