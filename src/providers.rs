@@ -25,6 +25,20 @@ pub enum Role {
     Tool,
 }
 
+/// Token accounting for one completion, as reported by the provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+}
+
 /// One turn in the conversation, in provider-neutral form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
@@ -37,6 +51,9 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Present on assistant messages parsed from an API response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 impl Message {
@@ -47,6 +64,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
+            usage: None,
         }
     }
 
@@ -57,6 +75,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             is_error: false,
+            usage: None,
         }
     }
 
@@ -67,16 +86,38 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(id.into()),
             is_error,
+            usage: None,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct ProviderError(pub String);
+pub struct ProviderError {
+    pub message: String,
+    /// Worth retrying: rate limits, overload, network failures. Bad requests
+    /// and auth failures are not.
+    pub retryable: bool,
+}
+
+impl ProviderError {
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+}
 
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "provider error: {}", self.0)
+        write!(f, "provider error: {}", self.message)
     }
 }
 
@@ -101,13 +142,27 @@ fn post(url: &str, headers: &[(&str, &str)], body: Value) -> Result<Value, Provi
     match request.send_json(body) {
         Ok(response) => response
             .into_json()
-            .map_err(|e| ProviderError(format!("invalid JSON response: {e}"))),
+            .map_err(|e| ProviderError::fatal(format!("invalid JSON response: {e}"))),
         Err(ureq::Error::Status(code, response)) => {
             let detail = response.into_string().unwrap_or_default();
-            Err(ProviderError(format!("HTTP {code}: {detail}")))
+            let message = format!("HTTP {code}: {detail}");
+            if matches!(code, 408 | 429 | 500..=599) {
+                Err(ProviderError::transient(message))
+            } else {
+                Err(ProviderError::fatal(message))
+            }
         }
-        Err(e) => Err(ProviderError(e.to_string())),
+        // Transport-level failures (DNS, refused, reset) are worth retrying.
+        Err(e) => Err(ProviderError::transient(e.to_string())),
     }
+}
+
+fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Option<Usage> {
+    let usage = body.get("usage")?;
+    Some(Usage {
+        input_tokens: usage[input_key].as_u64().unwrap_or(0),
+        output_tokens: usage[output_key].as_u64().unwrap_or(0),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -179,10 +234,16 @@ pub fn anthropic_build_request(
             _ => out.push(json!({"role": role, "content": blocks})),
         }
     }
+    // System and tools are stable across a session; cache_control markers
+    // let the API reuse them instead of re-processing every request.
+    let mut tools = tools.to_vec();
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
     json!({
         "model": model,
         "max_tokens": max_tokens,
-        "system": system,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": out,
         "tools": tools,
     })
@@ -191,7 +252,7 @@ pub fn anthropic_build_request(
 pub fn anthropic_parse_response(body: &Value) -> Result<Message, ProviderError> {
     let blocks = body["content"]
         .as_array()
-        .ok_or_else(|| ProviderError(format!("unexpected response shape: {body}")))?;
+        .ok_or_else(|| ProviderError::fatal(format!("unexpected response shape: {body}")))?;
     let mut content = String::new();
     let mut tool_calls = Vec::new();
     for block in blocks {
@@ -205,7 +266,9 @@ pub fn anthropic_parse_response(body: &Value) -> Result<Message, ProviderError> 
             _ => {}
         }
     }
-    Ok(Message::assistant(content, tool_calls))
+    let mut message = Message::assistant(content, tool_calls);
+    message.usage = parse_usage(body, "input_tokens", "output_tokens");
+    Ok(message)
 }
 
 impl Provider for AnthropicProvider {
@@ -308,7 +371,9 @@ pub fn openai_build_request(
 pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
     let message = &body["choices"][0]["message"];
     if message.is_null() {
-        return Err(ProviderError(format!("unexpected response shape: {body}")));
+        return Err(ProviderError::fatal(format!(
+            "unexpected response shape: {body}"
+        )));
     }
     let content = message["content"].as_str().unwrap_or_default().to_string();
     let tool_calls = message["tool_calls"]
@@ -330,7 +395,9 @@ pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Message::assistant(content, tool_calls))
+    let mut message = Message::assistant(content, tool_calls);
+    message.usage = parse_usage(body, "prompt_tokens", "completion_tokens");
+    Ok(message)
 }
 
 impl Provider for OpenAIProvider {
@@ -384,8 +451,17 @@ mod tests {
     #[test]
     fn anthropic_request_shapes_history_into_content_blocks() {
         let body = anthropic_build_request("m", 100, "sys", &history(), &tools());
-        assert_eq!(body["system"], "sys");
-        assert_eq!(body["tools"], json!(tools()));
+        // System and the last tool carry cache markers for prompt caching.
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["content"], json!([{"type": "text", "text": "hi"}]));
@@ -448,10 +524,18 @@ mod tests {
                 {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.txt"}},
             ],
             "stop_reason": "tool_use",
+            "usage": {"input_tokens": 120, "output_tokens": 45},
         }))
         .unwrap();
         assert_eq!(reply.role, Role::Assistant);
         assert_eq!(reply.content, "reading");
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                input_tokens: 120,
+                output_tokens: 45
+            })
+        );
         assert_eq!(
             reply.tool_calls,
             vec![ToolCall {
@@ -496,9 +580,17 @@ mod tests {
                     }],
                 },
             }],
+            "usage": {"prompt_tokens": 80, "completion_tokens": 20},
         }))
         .unwrap();
         assert_eq!(reply.content, "");
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                input_tokens: 80,
+                output_tokens: 20
+            })
+        );
         assert_eq!(
             reply.tool_calls,
             vec![ToolCall {

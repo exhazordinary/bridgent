@@ -50,7 +50,7 @@ impl<'a> Agent<'a> {
     ) -> Result<String, ProviderError> {
         session
             .append(Message::user(user_input))
-            .map_err(|e| ProviderError(format!("cannot persist session: {e}")))?;
+            .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
         loop {
             let schemas = self.tools.schemas();
             let reply = self.complete_with_retry(&session.messages, &schemas)?;
@@ -61,7 +61,7 @@ impl<'a> Agent<'a> {
             let final_text = reply.content.clone();
             session
                 .append(reply)
-                .map_err(|e| ProviderError(format!("cannot persist session: {e}")))?;
+                .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
             if tool_calls.is_empty() {
                 return Ok(final_text);
             }
@@ -75,7 +75,7 @@ impl<'a> Agent<'a> {
                         &result.output,
                         result.is_error,
                     ))
-                    .map_err(|e| ProviderError(format!("cannot persist session: {e}")))?;
+                    .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
             }
         }
     }
@@ -86,7 +86,7 @@ impl<'a> Agent<'a> {
         tools: &[serde_json::Value],
     ) -> Result<Message, ProviderError> {
         let mut delay = self.retry_delay;
-        let mut last_error = ProviderError("no attempts made".into());
+        let mut last_error = ProviderError::fatal("no attempts made");
         for attempt in 0..self.max_attempts {
             if attempt > 0 {
                 std::thread::sleep(delay);
@@ -94,6 +94,9 @@ impl<'a> Agent<'a> {
             }
             match self.provider.complete(&self.system, messages, tools) {
                 Ok(reply) => return Ok(reply),
+                // Retrying a fatal error (bad request, auth) wastes time
+                // and money; only transient failures get another attempt.
+                Err(e) if !e.retryable => return Err(e),
                 Err(e) => last_error = e,
             }
         }
@@ -274,7 +277,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tools = crate::tools::default_registry(dir.path());
         let provider = ScriptedProvider::new(vec![
-            Err(ProviderError("HTTP 529: overloaded".into())),
+            Err(ProviderError::transient("HTTP 529: overloaded")),
             Ok(Message::assistant("recovered", vec![])),
         ]);
         let mut session = Session::create(dir.path()).unwrap();
@@ -286,19 +289,36 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_retries_return_the_last_error() {
+    fn fatal_provider_errors_are_not_retried() {
         let dir = TempDir::new().unwrap();
         let tools = crate::tools::default_registry(dir.path());
         let provider = ScriptedProvider::new(vec![
-            Err(ProviderError("boom 1".into())),
-            Err(ProviderError("boom 2".into())),
-            Err(ProviderError("boom 3".into())),
+            Err(ProviderError::fatal("HTTP 401: bad key")),
+            Ok(Message::assistant("never reached", vec![])),
         ]);
         let mut session = Session::create(dir.path()).unwrap();
 
         let error = agent_fixture(&provider, &tools)
             .run_turn(&mut session, "hi", |_| {})
             .unwrap_err();
-        assert!(error.0.contains("boom 3"));
+        assert!(error.message.contains("bad key"));
+        assert_eq!(provider.calls.borrow().len(), 1); // no second attempt
+    }
+
+    #[test]
+    fn exhausted_retries_return_the_last_error() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![
+            Err(ProviderError::transient("boom 1")),
+            Err(ProviderError::transient("boom 2")),
+            Err(ProviderError::transient("boom 3")),
+        ]);
+        let mut session = Session::create(dir.path()).unwrap();
+
+        let error = agent_fixture(&provider, &tools)
+            .run_turn(&mut session, "hi", |_| {})
+            .unwrap_err();
+        assert!(error.message.contains("boom 3"));
     }
 }

@@ -170,7 +170,7 @@ mod tests {
             self.prompts.borrow_mut().push(messages[0].content.clone());
             let mut replies = self.replies.borrow_mut();
             if replies.is_empty() {
-                return Err(ProviderError("script exhausted".into()));
+                return Err(ProviderError::fatal("script exhausted"));
             }
             Ok(Message::assistant(replies.remove(0), vec![]))
         }
