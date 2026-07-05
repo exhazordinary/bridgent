@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bridgent::agent::{Agent, Event};
+use bridgent::cli::{self, ProviderFlags};
 use bridgent::config::Config;
 use bridgent::context::system_prompt;
 use bridgent::providers::Usage;
@@ -35,36 +36,24 @@ Environment:
   ANTHROPIC_API_KEY / OPENAI_API_KEY   provider credentials
   BRIDGENT_PROVIDER, BRIDGENT_MODEL, BRIDGENT_BASE_URL   defaults for the flags";
 
+#[derive(Default)]
 struct Args {
     prompt: Option<String>,
     resume: bool,
     resume_path: Option<PathBuf>,
     list_sessions: bool,
     json: bool,
-    provider: Option<String>,
-    model: Option<String>,
-    base_url: Option<String>,
+    flags: ProviderFlags,
 }
 
 fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
-    let mut args = Args {
-        prompt: None,
-        resume: false,
-        resume_path: None,
-        list_sessions: false,
-        json: false,
-        provider: None,
-        model: None,
-        base_url: None,
-    };
+    let mut args = Args::default();
     let mut words: Vec<String> = Vec::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        let mut flag_value = |name: &str| {
-            iter.next()
-                .cloned()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
+        if args.flags.parse(arg, &mut iter)? {
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -75,12 +64,11 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-c" | "--continue" => args.resume = true,
-            "--resume" => args.resume_path = Some(PathBuf::from(flag_value("--resume")?)),
+            "--resume" => {
+                args.resume_path = Some(PathBuf::from(cli::flag_value(&mut iter, "--resume")?))
+            }
             "--sessions" => args.list_sessions = true,
             "--json" => args.json = true,
-            "--provider" => args.provider = Some(flag_value("--provider")?),
-            "--model" => args.model = Some(flag_value("--model")?),
-            "--base-url" => args.base_url = Some(flag_value("--base-url")?),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
             word => words.push(word.to_string()),
         }
@@ -180,12 +168,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let mut config = Config::resolve(
-        |key| std::env::var(key).ok(),
-        args.provider.as_deref(),
-        args.model.as_deref(),
-        args.base_url.as_deref(),
-    )?;
+    let mut config = Config::from_env(&args.flags)?;
     let mut provider = config.build_provider();
     let tools = default_registry(&workdir);
     let system = system_prompt(&workdir);
@@ -343,11 +326,5 @@ fn run_command(
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("bridgent: {message}");
-            ExitCode::FAILURE
-        }
-    }
+    cli::exit("bridgent", run())
 }

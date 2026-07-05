@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bridgent::arc::{load_task, score_predictions, solve, ArcTask, Solution};
+use bridgent::cli::{self, ProviderFlags};
 use bridgent::config::Config;
 use bridgent::providers::Provider;
 use bridgent::refine::{RefineConfig, RefineEvent};
@@ -39,26 +40,20 @@ stdout; progress on stderr. Task format: ARC JSON with train/test grids.";
 struct Args {
     tasks: Vec<PathBuf>,
     refine: RefineConfig,
-    provider: Option<String>,
-    model: Option<String>,
-    base_url: Option<String>,
+    flags: ProviderFlags,
 }
 
 fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     let mut refine = RefineConfig::default();
-    let mut provider = None;
-    let mut model = None;
-    let mut base_url = None;
+    let mut flags = ProviderFlags::default();
     let mut tasks: Vec<PathBuf> = Vec::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        let mut flag_value = |name: &str| {
-            iter.next()
-                .cloned()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
-        let parse_count = |name: &str, value: String| {
-            value
+        if flags.parse(arg, &mut iter)? {
+            continue;
+        }
+        let mut count_flag = |name: &str| {
+            cli::flag_value(&mut iter, name)?
                 .parse::<usize>()
                 .map_err(|_| format!("{name} must be a number"))
         };
@@ -67,13 +62,10 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
                 println!("{USAGE}");
                 return Ok(None);
             }
-            "--dir" => tasks.extend(tasks_in_dir(&flag_value("--dir")?)?),
-            "--rounds" => refine.rounds = parse_count("--rounds", flag_value("--rounds")?)?,
-            "--samples" => refine.per_round = parse_count("--samples", flag_value("--samples")?)?,
-            "--keep" => refine.keep_top = parse_count("--keep", flag_value("--keep")?)?,
-            "--provider" => provider = Some(flag_value("--provider")?),
-            "--model" => model = Some(flag_value("--model")?),
-            "--base-url" => base_url = Some(flag_value("--base-url")?),
+            "--rounds" => refine.rounds = count_flag("--rounds")?,
+            "--samples" => refine.per_round = count_flag("--samples")?,
+            "--keep" => refine.keep_top = count_flag("--keep")?,
+            "--dir" => tasks.extend(tasks_in_dir(&cli::flag_value(&mut iter, "--dir")?)?),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
             path => tasks.push(PathBuf::from(path)),
         }
@@ -84,9 +76,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     Ok(Some(Args {
         tasks,
         refine,
-        provider,
-        model,
-        base_url,
+        flags,
     }))
 }
 
@@ -134,12 +124,7 @@ fn run() -> Result<(), String> {
     let Some(args) = parse_args(&argv)? else {
         return Ok(());
     };
-    let config = Config::resolve(
-        |key| std::env::var(key).ok(),
-        args.provider.as_deref(),
-        args.model.as_deref(),
-        args.base_url.as_deref(),
-    )?;
+    let config = Config::from_env(&args.flags)?;
     let provider = config.build_provider();
 
     // Single task: predictions on stdout, ready to pipe.
@@ -209,11 +194,5 @@ fn run() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("bridgent-arc: {message}");
-            ExitCode::FAILURE
-        }
-    }
+    cli::exit("bridgent-arc", run())
 }

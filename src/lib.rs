@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod arc;
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod process;

@@ -36,6 +36,15 @@ impl ProviderKind {
             Self::OpenAI => "OPENAI_API_KEY",
         }
     }
+
+    /// Env var carrying a bearer token that replaces the API key, if the
+    /// provider supports one.
+    fn auth_token_var(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some("ANTHROPIC_AUTH_TOKEN"),
+            Self::OpenAI => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +59,16 @@ pub struct Config {
 }
 
 impl Config {
+    /// Resolve config from the process environment and parsed CLI flags.
+    pub fn from_env(flags: &crate::cli::ProviderFlags) -> Result<Self, String> {
+        Self::resolve(
+            |key| std::env::var(key).ok(),
+            flags.provider.as_deref(),
+            flags.model.as_deref(),
+            flags.base_url.as_deref(),
+        )
+    }
+
     /// Resolve config from an environment lookup (injectable for tests) and
     /// optional flag overrides.
     pub fn resolve(
@@ -70,20 +89,18 @@ impl Config {
         let base_url = base_url_flag
             .map(str::to_string)
             .or_else(|| env("BRIDGENT_BASE_URL"));
-        let auth_token = match provider {
-            ProviderKind::Anthropic => env("ANTHROPIC_AUTH_TOKEN"),
-            ProviderKind::OpenAI => None,
-        };
+        let auth_token = provider.auth_token_var().and_then(&env);
         // Local OpenAI-compatible servers (ollama, vllm) don't need a real
         // key, and a bearer token replaces the API key entirely.
         let api_key = match env(provider.key_var()) {
             Some(key) => key,
             None if base_url.is_some() || auth_token.is_some() => String::new(),
             None => {
-                return Err(format!(
-                    "{} is not set (for anthropic, ANTHROPIC_AUTH_TOKEN also works)",
-                    provider.key_var()
-                ))
+                let hint = provider
+                    .auth_token_var()
+                    .map(|var| format!(" ({var} also works)"))
+                    .unwrap_or_default();
+                return Err(format!("{} is not set{hint}", provider.key_var()));
             }
         };
         Ok(Self {
