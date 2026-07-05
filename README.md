@@ -29,6 +29,9 @@ Built on the converging lessons of harness-engineering research and practice:
 
 ## Install
 
+Prebuilt binaries for macOS (Apple silicon + Intel) and Linux are attached to
+[GitHub releases](https://github.com/exhazordinary/bridgent/releases). Or:
+
 ```sh
 cargo install --path .
 ```
