@@ -20,6 +20,7 @@ Usage:
 
 Options:
   -c, --continue          resume the most recent session
+      --resume <PATH>     resume a specific session file (see --sessions)
       --sessions          list sessions in this directory and exit
       --provider <NAME>   anthropic (default) or openai
       --model <MODEL>     model id (default per provider)
@@ -36,6 +37,7 @@ Environment:
 struct Args {
     prompt: Option<String>,
     resume: bool,
+    resume_path: Option<PathBuf>,
     list_sessions: bool,
     provider: Option<String>,
     model: Option<String>,
@@ -46,6 +48,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     let mut args = Args {
         prompt: None,
         resume: false,
+        resume_path: None,
         list_sessions: false,
         provider: None,
         model: None,
@@ -69,6 +72,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-c" | "--continue" => args.resume = true,
+            "--resume" => args.resume_path = Some(PathBuf::from(flag_value("--resume")?)),
             "--sessions" => args.list_sessions = true,
             "--provider" => args.provider = Some(flag_value("--provider")?),
             "--model" => args.model = Some(flag_value("--model")?),
@@ -146,28 +150,32 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let config = Config::resolve(
+    let mut config = Config::resolve(
         |key| std::env::var(key).ok(),
         args.provider.as_deref(),
         args.model.as_deref(),
         args.base_url.as_deref(),
     )?;
-    let provider = config.build_provider();
+    let mut provider = config.build_provider();
     let tools = default_registry(&workdir);
-    let agent = Agent::new(provider.as_ref(), &tools, system_prompt(&workdir));
+    let system = system_prompt(&workdir);
 
-    let mut session = if args.resume {
-        match Session::latest(&workdir) {
+    let mut session = match (&args.resume_path, args.resume) {
+        (Some(path), _) => {
+            Session::open(path).map_err(|e| format!("cannot resume session: {e}"))?
+        }
+        (None, true) => match Session::latest(&workdir) {
             Some(session) => session.map_err(|e| format!("cannot resume session: {e}"))?,
             None => return Err("no previous session to continue".into()),
+        },
+        (None, false) => {
+            Session::create(&workdir).map_err(|e| format!("cannot create session: {e}"))?
         }
-    } else {
-        Session::create(&workdir).map_err(|e| format!("cannot create session: {e}"))?
     };
 
     if let Some(prompt) = args.prompt {
         // The answer streams through print_event; just terminate the line.
-        agent
+        Agent::new(provider.as_ref(), &tools, system)
             .run_turn(&mut session, &prompt, print_event)
             .map_err(|e| e.to_string())?;
         println!();
@@ -198,13 +206,25 @@ fn run() -> Result<(), String> {
         if input.is_empty() {
             return Ok(());
         }
+        // The agent is rebuilt per turn (it's just borrows) so /model can
+        // swap the provider between turns.
         if let Some(command) = input.strip_prefix('/') {
-            match run_command(command, &agent, &mut session, &workdir) {
+            let result = run_command(
+                command,
+                &mut config,
+                &mut provider,
+                &tools,
+                &system,
+                &mut session,
+                &workdir,
+            );
+            match result {
                 Ok(output) => eprintln!("{output}\n"),
                 Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
             }
             continue;
         }
+        let agent = Agent::new(provider.as_ref(), &tools, system.clone());
         match agent.run_turn(&mut session, input, print_event) {
             Ok(_) => println!("\n"), // answer already streamed
             // Provider errors don't kill the REPL; the session file is intact.
@@ -214,30 +234,47 @@ fn run() -> Result<(), String> {
 }
 
 /// REPL slash commands. Everything else in the loop goes to the model.
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     command: &str,
-    agent: &Agent,
+    config: &mut Config,
+    provider: &mut Box<dyn bridgent::providers::Provider>,
+    tools: &bridgent::tools::ToolRegistry,
+    system: &str,
     session: &mut Session,
     workdir: &std::path::Path,
 ) -> Result<String, String> {
-    match command {
-        "help" => Ok("/new      start a fresh session\n\
-                      /compact  summarize old history to reclaim context\n\
-                      /usage    token totals for this session\n\
-                      /help     this text"
+    match command
+        .split_once(' ')
+        .map_or((command, ""), |(c, rest)| (c, rest.trim()))
+    {
+        ("help", _) => Ok("/new           start a fresh session\n\
+                      /compact       summarize old history to reclaim context\n\
+                      /model [ID]    show or switch the model\n\
+                      /usage         token totals for this session\n\
+                      /help          this text"
             .into()),
-        "new" => {
+        ("new", _) => {
             *session = Session::create(workdir).map_err(|e| e.to_string())?;
             Ok("started a fresh session".into())
         }
-        "compact" => match agent.compact(session).map_err(|e| e.to_string())? {
-            true => Ok(format!(
-                "history compacted to {} messages",
-                session.messages.len()
-            )),
-            false => Ok("nothing to compact yet".into()),
-        },
-        "usage" => {
+        ("compact", _) => {
+            let agent = Agent::new(provider.as_ref(), tools, system.to_string());
+            match agent.compact(session).map_err(|e| e.to_string())? {
+                true => Ok(format!(
+                    "history compacted to {} messages",
+                    session.messages.len()
+                )),
+                false => Ok("nothing to compact yet".into()),
+            }
+        }
+        ("model", "") => Ok(format!("current model: {}", config.model)),
+        ("model", id) => {
+            config.model = id.to_string();
+            *provider = config.build_provider();
+            Ok(format!("switched to {id}"))
+        }
+        ("usage", _) => {
             let mut total = Usage::default();
             for usage in session.messages.iter().filter_map(|m| m.usage) {
                 total.add(usage);
@@ -249,7 +286,7 @@ fn run_command(
                 total.output_tokens
             ))
         }
-        other => Err(format!("unknown command /{other} (try /help)")),
+        (other, _) => Err(format!("unknown command /{other} (try /help)")),
     }
 }
 
