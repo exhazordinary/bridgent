@@ -10,7 +10,30 @@ use std::io::BufRead;
 
 use serde_json::Value;
 
-use crate::providers::{Message, ProviderError, ToolCall, Usage};
+use crate::providers::{parse_usage, Message, ProviderError, ToolCall, Usage};
+
+/// A state machine turning one provider's SSE events into a `Message`.
+pub trait SseAccumulator: Default {
+    /// Digest one parsed event, streaming any text through `on_text`.
+    fn handle(&mut self, event: &Value, on_text: &mut dyn FnMut(&str))
+        -> Result<(), ProviderError>;
+    fn finish(self) -> Message;
+}
+
+/// Drive a full SSE body through an accumulator: parse each `data:` payload
+/// as JSON, feed it to the accumulator, return the finished message.
+pub fn drive_stream<A: SseAccumulator>(
+    reader: impl BufRead,
+    mut acc: A,
+    on_text: &mut dyn FnMut(&str),
+) -> Result<Message, ProviderError> {
+    each_sse_data(reader, |data| {
+        let event: Value = serde_json::from_str(data)
+            .map_err(|e| ProviderError::fatal(format!("invalid stream event: {e}")))?;
+        acc.handle(&event, on_text)
+    })?;
+    Ok(acc.finish())
+}
 
 /// Read an SSE body line by line, invoking `on_data` for each `data:`
 /// payload. Ignores comments, event names, and keep-alive blank lines.
@@ -41,9 +64,18 @@ pub struct AnthropicAccumulator {
     usage: Usage,
 }
 
-impl AnthropicAccumulator {
-    pub fn handle(&mut self, event: &Value, mut on_text: impl FnMut(&str)) {
+impl SseAccumulator for AnthropicAccumulator {
+    fn handle(
+        &mut self,
+        event: &Value,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderError> {
         match event["type"].as_str() {
+            Some("error") => {
+                return Err(ProviderError::transient(
+                    event["error"]["message"].to_string(),
+                ))
+            }
             Some("message_start") => {
                 self.usage.input_tokens = event["message"]["usage"]["input_tokens"]
                     .as_u64()
@@ -87,12 +119,11 @@ impl AnthropicAccumulator {
             }
             _ => {}
         }
+        Ok(())
     }
 
-    pub fn finish(self) -> Message {
-        let mut message = Message::assistant(self.content, self.tool_calls);
-        message.usage = Some(self.usage);
-        message
+    fn finish(self) -> Message {
+        Message::assistant_with_usage(self.content, self.tool_calls, Some(self.usage))
     }
 }
 
@@ -100,14 +131,24 @@ impl AnthropicAccumulator {
 #[derive(Default)]
 pub struct OpenAIAccumulator {
     content: String,
-    tool_calls: Vec<ToolCall>,
-    /// Argument JSON accumulates per tool call, keyed by chunk index.
-    pending_args: Vec<String>,
+    /// Tool calls under construction; argument JSON arrives in fragments.
+    partial_calls: Vec<PartialCall>,
     usage: Option<Usage>,
 }
 
-impl OpenAIAccumulator {
-    pub fn handle(&mut self, chunk: &Value, mut on_text: impl FnMut(&str)) {
+#[derive(Default)]
+struct PartialCall {
+    id: String,
+    name: String,
+    args_json: String,
+}
+
+impl SseAccumulator for OpenAIAccumulator {
+    fn handle(
+        &mut self,
+        chunk: &Value,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderError> {
         let delta = &chunk["choices"][0]["delta"];
         if let Some(text) = delta["content"].as_str() {
             self.content.push_str(text);
@@ -116,41 +157,40 @@ impl OpenAIAccumulator {
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
                 let index = call["index"].as_u64().unwrap_or(0) as usize;
-                while self.tool_calls.len() <= index {
-                    self.tool_calls.push(ToolCall {
-                        id: String::new(),
-                        name: String::new(),
-                        args: Value::Null,
-                    });
-                    self.pending_args.push(String::new());
+                while self.partial_calls.len() <= index {
+                    self.partial_calls.push(PartialCall::default());
                 }
+                let partial = &mut self.partial_calls[index];
                 if let Some(id) = call["id"].as_str() {
-                    self.tool_calls[index].id = id.to_string();
+                    partial.id = id.to_string();
                 }
                 if let Some(name) = call["function"]["name"].as_str() {
-                    self.tool_calls[index].name = name.to_string();
+                    partial.name = name.to_string();
                 }
                 if let Some(args) = call["function"]["arguments"].as_str() {
-                    self.pending_args[index].push_str(args);
+                    partial.args_json.push_str(args);
                 }
             }
         }
         // With stream_options.include_usage, the final chunk carries usage.
-        if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
-            self.usage = Some(Usage {
-                input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
-                output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-            });
+        if let Some(usage) = parse_usage(chunk, "prompt_tokens", "completion_tokens") {
+            self.usage = Some(usage);
         }
+        Ok(())
     }
 
-    pub fn finish(mut self) -> Message {
-        for (call, args) in self.tool_calls.iter_mut().zip(&self.pending_args) {
-            call.args = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({}));
-        }
-        let mut message = Message::assistant(self.content, self.tool_calls);
-        message.usage = self.usage;
-        message
+    fn finish(self) -> Message {
+        let tool_calls = self
+            .partial_calls
+            .into_iter()
+            .map(|call| ToolCall {
+                args: serde_json::from_str(&call.args_json)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                id: call.id,
+                name: call.name,
+            })
+            .collect();
+        Message::assistant_with_usage(self.content, tool_calls, self.usage)
     }
 }
 
@@ -159,14 +199,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn collect_stream<A>(
-        events: &[Value],
-        mut handle: impl FnMut(&mut A, &Value, &mut dyn FnMut(&str)),
-        mut acc: A,
-    ) -> (A, String) {
+    fn collect_stream<A: SseAccumulator>(events: &[Value]) -> (A, String) {
+        let mut acc = A::default();
         let mut streamed = String::new();
         for event in events {
-            handle(&mut acc, event, &mut |t| streamed.push_str(t));
+            acc.handle(event, &mut |t| streamed.push_str(t)).unwrap();
         }
         (acc, streamed)
     }
@@ -193,11 +230,7 @@ mod tests {
             json!({"type": "content_block_stop"}),
             json!({"type": "message_delta", "usage": {"output_tokens": 7}}),
         ];
-        let (acc, streamed) = collect_stream(
-            &events,
-            |a: &mut AnthropicAccumulator, e, f| a.handle(e, f),
-            AnthropicAccumulator::default(),
-        );
+        let (acc, streamed) = collect_stream::<AnthropicAccumulator>(&events);
         assert_eq!(streamed, "hello");
         let message = acc.finish();
         assert_eq!(message.content, "hello");
@@ -221,11 +254,7 @@ mod tests {
                    "delta": {"type": "input_json_delta", "partial_json": "th\": \"a.txt\"}"}}),
             json!({"type": "content_block_stop"}),
         ];
-        let (acc, streamed) = collect_stream(
-            &events,
-            |a: &mut AnthropicAccumulator, e, f| a.handle(e, f),
-            AnthropicAccumulator::default(),
-        );
+        let (acc, streamed) = collect_stream::<AnthropicAccumulator>(&events);
         assert_eq!(streamed, "");
         let message = acc.finish();
         assert_eq!(
@@ -251,11 +280,7 @@ mod tests {
             ]}}]}),
             json!({"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 4}}),
         ];
-        let (acc, streamed) = collect_stream(
-            &chunks,
-            |a: &mut OpenAIAccumulator, e, f| a.handle(e, f),
-            OpenAIAccumulator::default(),
-        );
+        let (acc, streamed) = collect_stream::<OpenAIAccumulator>(&chunks);
         assert_eq!(streamed, "working");
         let message = acc.finish();
         assert_eq!(message.content, "working");
@@ -285,11 +310,7 @@ mod tests {
                    "delta": {"type": "input_json_delta", "partial_json": "{broken"}}),
             json!({"type": "content_block_stop"}),
         ];
-        let (acc, _) = collect_stream(
-            &events,
-            |a: &mut AnthropicAccumulator, e, f| a.handle(e, f),
-            AnthropicAccumulator::default(),
-        );
+        let (acc, _) = collect_stream::<AnthropicAccumulator>(&events);
         assert_eq!(acc.finish().tool_calls[0].args, json!({}));
     }
 }

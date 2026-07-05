@@ -143,37 +143,11 @@ pub fn extract_code(reply: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolSchema;
-    use std::cell::RefCell;
+    use crate::providers::test_support::ScriptedProvider;
 
-    struct ScriptedProvider {
-        replies: RefCell<Vec<String>>,
-        prompts: RefCell<Vec<String>>,
-    }
-
-    impl ScriptedProvider {
-        fn new(replies: &[&str]) -> Self {
-            Self {
-                replies: RefCell::new(replies.iter().map(|s| s.to_string()).collect()),
-                prompts: RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl Provider for ScriptedProvider {
-        fn complete(
-            &self,
-            _system: &str,
-            messages: &[Message],
-            _tools: &[ToolSchema],
-        ) -> Result<Message, ProviderError> {
-            self.prompts.borrow_mut().push(messages[0].content.clone());
-            let mut replies = self.replies.borrow_mut();
-            if replies.is_empty() {
-                return Err(ProviderError::fatal("script exhausted"));
-            }
-            Ok(Message::assistant(replies.remove(0), vec![]))
-        }
+    /// The prompt sent on the i-th model call.
+    fn prompt(provider: &ScriptedProvider, i: usize) -> String {
+        provider.calls.borrow()[i][0].content.clone()
     }
 
     /// Scores a candidate by exact match against a target string.
@@ -199,7 +173,7 @@ mod tests {
 
     #[test]
     fn stops_early_when_a_candidate_solves_the_task() {
-        let provider = ScriptedProvider::new(&["wrong", "right", "never sampled"]);
+        let provider = ScriptedProvider::texts(&["wrong", "right", "never sampled"]);
         let config = RefineConfig {
             rounds: 3,
             per_round: 2,
@@ -213,7 +187,7 @@ mod tests {
 
     #[test]
     fn later_rounds_see_prior_attempts_and_feedback() {
-        let provider = ScriptedProvider::new(&["alpha", "beta", "gamma", "delta"]);
+        let provider = ScriptedProvider::texts(&["alpha", "beta", "gamma", "delta"]);
         let config = RefineConfig {
             rounds: 2,
             per_round: 2,
@@ -221,20 +195,19 @@ mod tests {
         };
         refine(&provider, "task", &ExactVerifier("zzz"), config, |_| {}).unwrap();
 
-        let prompts = provider.prompts.borrow();
-        assert_eq!(prompts[0], "task"); // round one: base prompt only
-        assert_eq!(prompts[1], "task");
+        assert_eq!(prompt(&provider, 0), "task"); // round one: base prompt only
+        assert_eq!(prompt(&provider, 1), "task");
         // round two: includes the best prior attempt and its feedback
-        assert!(prompts[2].contains("Previous attempts"));
-        assert!(prompts[2].contains("expected `zzz`"));
+        assert!(prompt(&provider, 2).contains("Previous attempts"));
+        assert!(prompt(&provider, 2).contains("expected `zzz`"));
         // keep_top=1: only the single best attempt is included
-        assert_eq!(prompts[2].matches("--- Attempt").count(), 1);
+        assert_eq!(prompt(&provider, 2).matches("--- Attempt").count(), 1);
     }
 
     #[test]
     fn pool_is_ranked_by_score_then_secondary() {
         // "longlonglong" ties "beta" on score 0.0 but wins on secondary.
-        let provider = ScriptedProvider::new(&["ab", "longlonglong"]);
+        let provider = ScriptedProvider::texts(&["ab", "longlonglong"]);
         let config = RefineConfig {
             rounds: 1,
             per_round: 2,
@@ -246,7 +219,7 @@ mod tests {
 
     #[test]
     fn events_report_samples_and_rounds() {
-        let provider = ScriptedProvider::new(&["a", "b"]);
+        let provider = ScriptedProvider::texts(&["a", "b"]);
         let config = RefineConfig {
             rounds: 2,
             per_round: 1,
@@ -267,7 +240,7 @@ mod tests {
 
     #[test]
     fn provider_errors_propagate() {
-        let provider = ScriptedProvider::new(&[]);
+        let provider = ScriptedProvider::texts(&[]);
         let config = RefineConfig::default();
         assert!(refine(&provider, "task", &ExactVerifier("x"), config, |_| {}).is_err());
     }

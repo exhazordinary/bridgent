@@ -180,36 +180,9 @@ impl<'a> Agent<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_support::ScriptedProvider;
     use serde_json::json;
-    use std::cell::RefCell;
     use tempfile::TempDir;
-
-    /// A provider that replays a script of canned responses.
-    struct ScriptedProvider {
-        script: RefCell<Vec<Result<Message, ProviderError>>>,
-        calls: RefCell<Vec<Vec<Message>>>,
-    }
-
-    impl ScriptedProvider {
-        fn new(script: Vec<Result<Message, ProviderError>>) -> Self {
-            Self {
-                script: RefCell::new(script),
-                calls: RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl Provider for ScriptedProvider {
-        fn complete(
-            &self,
-            _system: &str,
-            messages: &[Message],
-            _tools: &[ToolSchema],
-        ) -> Result<Message, ProviderError> {
-            self.calls.borrow_mut().push(messages.to_vec());
-            self.script.borrow_mut().remove(0)
-        }
-    }
 
     fn agent_fixture<'a>(
         provider: &'a ScriptedProvider,

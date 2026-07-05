@@ -81,6 +81,18 @@ impl Message {
         }
     }
 
+    /// An assistant message as parsed from an API response, usage included.
+    pub fn assistant_with_usage(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        usage: Option<Usage>,
+    ) -> Self {
+        Self {
+            usage,
+            ..Self::assistant(content, tool_calls)
+        }
+    }
+
     pub fn tool_result(id: impl Into<String>, output: impl Into<String>, is_error: bool) -> Self {
         Self {
             role: Role::Tool,
@@ -184,7 +196,7 @@ fn post(url: &str, headers: &[(String, String)], body: Value) -> Result<Value, P
         .map_err(|e| ProviderError::fatal(format!("invalid JSON response: {e}")))
 }
 
-fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Option<Usage> {
+pub(crate) fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Option<Usage> {
     let usage = body.get("usage")?;
     Some(Usage {
         input_tokens: usage[input_key].as_u64().unwrap_or(0),
@@ -223,6 +235,10 @@ impl AnthropicProvider {
             None => ("x-api-key".into(), self.api_key.clone()),
         };
         vec![auth, ("anthropic-version".into(), "2023-06-01".into())]
+    }
+
+    fn url(&self) -> String {
+        format!("{}/v1/messages", self.base_url)
     }
 }
 
@@ -314,9 +330,11 @@ pub fn anthropic_parse_response(body: &Value) -> Result<Message, ProviderError> 
             _ => {}
         }
     }
-    let mut message = Message::assistant(content, tool_calls);
-    message.usage = parse_usage(body, "input_tokens", "output_tokens");
-    Ok(message)
+    Ok(Message::assistant_with_usage(
+        content,
+        tool_calls,
+        parse_usage(body, "input_tokens", "output_tokens"),
+    ))
 }
 
 impl Provider for AnthropicProvider {
@@ -327,11 +345,7 @@ impl Provider for AnthropicProvider {
         tools: &[ToolSchema],
     ) -> Result<Message, ProviderError> {
         let body = anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
-        let response = post(
-            &format!("{}/v1/messages", self.base_url),
-            &self.headers(),
-            body,
-        )?;
+        let response = post(&self.url(), &self.headers(), body)?;
         anthropic_parse_response(&response)
     }
 
@@ -345,24 +359,12 @@ impl Provider for AnthropicProvider {
         let mut body =
             anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
         body["stream"] = Value::Bool(true);
-        let response = send(
-            &format!("{}/v1/messages", self.base_url),
-            &self.headers(),
-            body,
-        )?;
-        let mut acc = crate::streaming::AnthropicAccumulator::default();
-        crate::streaming::each_sse_data(std::io::BufReader::new(response.into_reader()), |data| {
-            let event: Value = serde_json::from_str(data)
-                .map_err(|e| ProviderError::fatal(format!("invalid stream event: {e}")))?;
-            if event["type"] == "error" {
-                return Err(ProviderError::transient(
-                    event["error"]["message"].to_string(),
-                ));
-            }
-            acc.handle(&event, &mut *on_text);
-            Ok(())
-        })?;
-        Ok(acc.finish())
+        let response = send(&self.url(), &self.headers(), body)?;
+        crate::streaming::drive_stream(
+            std::io::BufReader::new(response.into_reader()),
+            crate::streaming::AnthropicAccumulator::default(),
+            on_text,
+        )
     }
 }
 
@@ -383,6 +385,14 @@ impl OpenAIProvider {
             model: model.into(),
             base_url: "https://api.openai.com/v1".into(),
         }
+    }
+
+    pub fn headers(&self) -> Vec<(String, String)> {
+        vec![("Authorization".into(), format!("Bearer {}", self.api_key))]
+    }
+
+    fn url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
     }
 }
 
@@ -470,9 +480,11 @@ pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
                 .collect()
         })
         .unwrap_or_default();
-    let mut message = Message::assistant(content, tool_calls);
-    message.usage = parse_usage(body, "prompt_tokens", "completion_tokens");
-    Ok(message)
+    Ok(Message::assistant_with_usage(
+        content,
+        tool_calls,
+        parse_usage(body, "prompt_tokens", "completion_tokens"),
+    ))
 }
 
 impl Provider for OpenAIProvider {
@@ -483,11 +495,7 @@ impl Provider for OpenAIProvider {
         tools: &[ToolSchema],
     ) -> Result<Message, ProviderError> {
         let body = openai_build_request(&self.model, system, messages, tools);
-        let response = post(
-            &format!("{}/chat/completions", self.base_url),
-            &[("Authorization".into(), format!("Bearer {}", self.api_key))],
-            body,
-        )?;
+        let response = post(&self.url(), &self.headers(), body)?;
         openai_parse_response(&response)
     }
 
@@ -501,19 +509,60 @@ impl Provider for OpenAIProvider {
         let mut body = openai_build_request(&self.model, system, messages, tools);
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
-        let response = send(
-            &format!("{}/chat/completions", self.base_url),
-            &[("Authorization".into(), format!("Bearer {}", self.api_key))],
-            body,
-        )?;
-        let mut acc = crate::streaming::OpenAIAccumulator::default();
-        crate::streaming::each_sse_data(std::io::BufReader::new(response.into_reader()), |data| {
-            let chunk: Value = serde_json::from_str(data)
-                .map_err(|e| ProviderError::fatal(format!("invalid stream chunk: {e}")))?;
-            acc.handle(&chunk, &mut *on_text);
-            Ok(())
-        })?;
-        Ok(acc.finish())
+        let response = send(&self.url(), &self.headers(), body)?;
+        crate::streaming::drive_stream(
+            std::io::BufReader::new(response.into_reader()),
+            crate::streaming::OpenAIAccumulator::default(),
+            on_text,
+        )
+    }
+}
+
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Replays a script of canned responses and records every call's
+    /// message history — the one `Provider` mock shared by all test modules.
+    pub struct ScriptedProvider {
+        script: RefCell<Vec<Result<Message, ProviderError>>>,
+        pub calls: RefCell<Vec<Vec<Message>>>,
+    }
+
+    impl ScriptedProvider {
+        pub fn new(script: Vec<Result<Message, ProviderError>>) -> Self {
+            Self {
+                script: RefCell::new(script),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Plain-text assistant replies, in order.
+        pub fn texts(replies: &[&str]) -> Self {
+            Self::new(
+                replies
+                    .iter()
+                    .map(|reply| Ok(Message::assistant(*reply, vec![])))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Provider for ScriptedProvider {
+        fn complete(
+            &self,
+            _system: &str,
+            messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<Message, ProviderError> {
+            self.calls.borrow_mut().push(messages.to_vec());
+            let mut script = self.script.borrow_mut();
+            if script.is_empty() {
+                return Err(ProviderError::fatal("script exhausted"));
+            }
+            script.remove(0)
+        }
     }
 }
 

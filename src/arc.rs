@@ -242,9 +242,7 @@ pub fn solve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{Message, ProviderError};
-    use crate::tools::ToolSchema;
-    use std::cell::RefCell;
+    use crate::providers::test_support::ScriptedProvider;
 
     /// Identity task: output equals input.
     fn identity_task() -> ArcTask {
@@ -366,27 +364,13 @@ mod tests {
         );
     }
 
-    struct ScriptedProvider(RefCell<Vec<String>>);
-
-    impl Provider for ScriptedProvider {
-        fn complete(
-            &self,
-            _system: &str,
-            _messages: &[Message],
-            _tools: &[ToolSchema],
-        ) -> Result<Message, ProviderError> {
-            Ok(Message::assistant(self.0.borrow_mut().remove(0), vec![]))
-        }
-    }
-
     #[test]
     fn solve_evolves_to_a_working_program_and_predicts_test_output() {
         // First sample is wrong (all zeros), second sample solves it.
-        let provider = ScriptedProvider(RefCell::new(vec![
-            "```python\ndef transform(grid):\n    return [[0 for _ in row] for row in grid]\n```"
-                .into(),
-            "```python\ndef transform(grid):\n    return grid\n```".into(),
-        ]));
+        let provider = ScriptedProvider::texts(&[
+            "```python\ndef transform(grid):\n    return [[0 for _ in row] for row in grid]\n```",
+            "```python\ndef transform(grid):\n    return grid\n```",
+        ]);
         let config = RefineConfig {
             rounds: 2,
             per_round: 1,
