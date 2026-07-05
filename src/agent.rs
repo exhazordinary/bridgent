@@ -62,7 +62,13 @@ pub struct Agent<'a> {
     /// (roughly 4 chars per token) rather than reported usage, because it
     /// shrinks consistently when compaction shrinks the history.
     pub compact_threshold_chars: usize,
+    /// When set (e.g. by a Ctrl-C handler), the turn stops at the next safe
+    /// checkpoint: before a model call, or between tool executions.
+    pub interrupt: Option<&'a std::sync::atomic::AtomicBool>,
 }
+
+/// The error a turn returns when stopped via the interrupt flag.
+pub const INTERRUPTED: &str = "interrupted by user";
 
 impl<'a> Agent<'a> {
     /// Recent messages preserved verbatim through compaction.
@@ -74,7 +80,13 @@ impl<'a> Agent<'a> {
             tools,
             system,
             compact_threshold_chars: 400_000, // ~100k tokens
+            interrupt: None,
         }
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Run one user turn to completion. Appends every message (user,
@@ -96,6 +108,9 @@ impl<'a> Agent<'a> {
         }
         let schemas = self.tools.schemas();
         loop {
+            if self.interrupted() {
+                return Err(ProviderError::fatal(INTERRUPTED));
+            }
             let reply = self.provider.complete_stream(
                 &self.system,
                 &session.messages,
@@ -112,14 +127,27 @@ impl<'a> Agent<'a> {
             }
             let tool_calls = reply.tool_calls.clone();
             persist(session, reply)?;
+            let mut cancelled = false;
             for call in &tool_calls {
-                on_event(Event::ToolStart(call));
-                let result = self.tools.run(&call.name, &call.args);
-                on_event(Event::ToolEnd(call, &result));
+                // Once the assistant's tool calls are persisted, every one
+                // needs a result — an unmatched call is an invalid history.
+                // On interrupt the remaining calls get cancellation results.
+                cancelled = cancelled || self.interrupted();
+                let result = if cancelled {
+                    ToolResult::err("cancelled: the user interrupted this turn")
+                } else {
+                    on_event(Event::ToolStart(call));
+                    let result = self.tools.run(&call.name, &call.args);
+                    on_event(Event::ToolEnd(call, &result));
+                    result
+                };
                 persist(
                     session,
                     Message::tool_result(&call.id, &result.output, result.is_error),
                 )?;
+            }
+            if cancelled {
+                return Err(ProviderError::fatal(INTERRUPTED));
             }
         }
     }
@@ -421,6 +449,66 @@ mod tests {
         assert!(session.messages[0].content.contains("summary of it all"));
         // The answer's model call ran on the compacted history.
         assert!(provider.calls.borrow()[1].len() < 15);
+    }
+
+    #[test]
+    fn interrupt_before_the_model_call_stops_the_turn() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![]);
+        let mut session = Session::create(dir.path()).unwrap();
+        let flag = std::sync::atomic::AtomicBool::new(true);
+
+        let mut agent = agent_fixture(&provider, &tools);
+        agent.interrupt = Some(&flag);
+        let error = agent.run_turn(&mut session, "hi", |_| {}).unwrap_err();
+
+        assert!(error.message.contains(INTERRUPTED));
+        assert_eq!(provider.calls.borrow().len(), 0); // no model call made
+        assert_eq!(session.messages.len(), 1); // the user message persists
+    }
+
+    #[test]
+    fn interrupt_mid_tools_cancels_the_rest_but_keeps_history_valid() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let provider = ScriptedProvider::new(vec![Ok(Message::assistant(
+            "",
+            vec![
+                ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    args: json!({"path": "a.txt"}),
+                },
+                ToolCall {
+                    id: "t2".into(),
+                    name: "read".into(),
+                    args: json!({"path": "b.txt"}),
+                },
+            ],
+        ))]);
+        let mut session = Session::create(dir.path()).unwrap();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+
+        let mut agent = agent_fixture(&provider, &tools);
+        agent.interrupt = Some(&flag);
+        let error = agent
+            .run_turn(&mut session, "read both", |event| {
+                // Interrupt lands while the first tool is running.
+                if matches!(event, Event::ToolStart(_)) {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.message.contains(INTERRUPTED));
+        // user, assistant, and BOTH tool results — history stays valid.
+        assert_eq!(session.messages.len(), 4);
+        assert_eq!(session.messages[2].content, "aaa"); // first ran normally
+        assert!(session.messages[3].content.contains("cancelled"));
+        assert!(session.messages[3].is_error);
     }
 
     #[test]

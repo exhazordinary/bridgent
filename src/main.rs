@@ -199,15 +199,22 @@ fn agent<'a>(provider: &'a dyn Provider, tools: &'a ToolRegistry, system: &str) 
     Agent::new(provider, tools, system.to_string())
 }
 
+/// Set by the SIGINT handler; each turn clears it on start and stops at the
+/// next safe checkpoint when it flips.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Repl {
     fn run(&mut self) -> Result<(), String> {
+        // Ctrl-C interrupts the current turn instead of killing the REPL.
+        ctrlc::set_handler(|| INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed))
+            .map_err(|e| format!("cannot install interrupt handler: {e}"))?;
         eprintln!(
             "bridgent {} · {} · {}",
             env!("CARGO_PKG_VERSION"),
             self.config.model,
             self.workdir.display()
         );
-        eprintln!("empty line or ctrl-d to exit\n");
+        eprintln!("empty line or ctrl-d to exit · ctrl-c interrupts a turn\n");
         let stdin = std::io::stdin();
         loop {
             eprint!("\x1b[1m>\x1b[0m ");
@@ -232,12 +239,14 @@ impl Repl {
                 }
                 continue;
             }
-            match agent(self.provider.as_ref(), &self.tools, &self.system).run_turn(
-                &mut self.session,
-                input,
-                print_event,
-            ) {
+            INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut turn = agent(self.provider.as_ref(), &self.tools, &self.system);
+            turn.interrupt = Some(&INTERRUPTED);
+            match turn.run_turn(&mut self.session, input, print_event) {
                 Ok(_) => println!("\n"), // answer already streamed
+                Err(e) if e.message == bridgent::agent::INTERRUPTED => {
+                    eprintln!("\x1b[2m⏹ turn interrupted\x1b[0m\n");
+                }
                 // Provider errors don't kill the REPL; the session is intact.
                 Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
             }

@@ -80,8 +80,10 @@ speaks it. For metered API access, use `ANTHROPIC_API_KEY`.
 
 ### Project instructions
 
-Put an `AGENTS.md` (or `CLAUDE.md`) in your working directory and its content
-is appended to the system prompt. That's the whole customization model.
+`AGENTS.md` (or `CLAUDE.md`) files are appended to the system prompt,
+broadest first: `~/.config/bridgent/AGENTS.md` (global), then every directory
+from the git root down to the working directory, so nearer guidance can
+override outer guidance. That's the whole customization model.
 
 ## The refine engine and `bridgent-arc`
 
@@ -152,7 +154,6 @@ If you need containment, run bridgent inside a container or VM.
 
 MCP, sub-agents, built-in todo lists, plan modes. Most of these are better
 served by bash and files; the rest can land later without touching the core.
-Known limitation: Ctrl-C aborts the whole process, not just the current turn.
 
 ## References
 
