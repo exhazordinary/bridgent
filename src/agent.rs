@@ -3,17 +3,21 @@
 //!
 //! No step limits, no hidden context injection. Tool failures are returned
 //! to the model as error results — it sees exactly what went wrong and can
-//! correct course. Transient provider failures are retried with backoff.
-
-use std::time::Duration;
+//! correct course. (Transient provider failures are retried by
+//! `RetryingProvider`, not here.)
 
 use crate::providers::{Message, Provider, ProviderError, Role, ToolCall};
 use crate::session::Session;
-use crate::tools::ToolSchema;
 use crate::tools::{ToolRegistry, ToolResult};
 
 fn history_chars(messages: &[Message]) -> usize {
     messages.iter().map(|m| m.content.len()).sum()
+}
+
+fn persist(session: &mut Session, message: Message) -> Result<(), ProviderError> {
+    session
+        .append(message)
+        .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))
 }
 
 /// Progress notifications emitted while a turn runs, for the UI layer.
@@ -34,12 +38,9 @@ pub struct Agent<'a> {
     pub provider: &'a dyn Provider,
     pub tools: &'a ToolRegistry,
     pub system: String,
-    /// Total attempts per model call (1 = no retry).
-    pub max_attempts: u32,
-    /// Base delay between retries; doubles each attempt.
-    pub retry_delay: Duration,
-    /// Auto-compact when history exceeds this many characters
-    /// (a proxy for tokens at roughly 4 chars each).
+    /// Auto-compact when history exceeds this many characters. A char proxy
+    /// (roughly 4 chars per token) rather than reported usage, because it
+    /// shrinks consistently when compaction shrinks the history.
     pub compact_threshold_chars: usize,
 }
 
@@ -52,8 +53,6 @@ impl<'a> Agent<'a> {
             provider,
             tools,
             system,
-            max_attempts: 3,
-            retry_delay: Duration::from_secs(1),
             compact_threshold_chars: 400_000, // ~100k tokens
         }
     }
@@ -67,9 +66,7 @@ impl<'a> Agent<'a> {
         user_input: &str,
         mut on_event: impl FnMut(Event),
     ) -> Result<String, ProviderError> {
-        session
-            .append(Message::user(user_input))
-            .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
+        persist(session, Message::user(user_input))?;
         if history_chars(&session.messages) > self.compact_threshold_chars
             && self.compact(session)?
         {
@@ -77,31 +74,32 @@ impl<'a> Agent<'a> {
                 kept: session.messages.len(),
             });
         }
+        let schemas = self.tools.schemas();
         loop {
-            let schemas = self.tools.schemas();
-            let reply = self.complete_with_retry(&session.messages, &schemas, &mut on_event)?;
+            let reply = self.provider.complete_stream(
+                &self.system,
+                &session.messages,
+                &schemas,
+                &mut |text| on_event(Event::AssistantDelta(text)),
+            )?;
             if !reply.content.is_empty() {
                 on_event(Event::AssistantText(&reply.content));
             }
-            let tool_calls = reply.tool_calls.clone();
-            let final_text = reply.content.clone();
-            session
-                .append(reply)
-                .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
-            if tool_calls.is_empty() {
-                return Ok(final_text);
+            if reply.tool_calls.is_empty() {
+                let answer = reply.content.clone();
+                persist(session, reply)?;
+                return Ok(answer);
             }
+            let tool_calls = reply.tool_calls.clone();
+            persist(session, reply)?;
             for call in &tool_calls {
                 on_event(Event::ToolStart(call));
                 let result = self.tools.run(&call.name, &call.args);
                 on_event(Event::ToolEnd(call, &result));
-                session
-                    .append(Message::tool_result(
-                        &call.id,
-                        &result.output,
-                        result.is_error,
-                    ))
-                    .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
+                persist(
+                    session,
+                    Message::tool_result(&call.id, &result.output, result.is_error),
+                )?;
             }
         }
     }
@@ -143,38 +141,6 @@ impl<'a> Agent<'a> {
             .map_err(|e| ProviderError::fatal(format!("cannot persist session: {e}")))?;
         Ok(true)
     }
-
-    fn complete_with_retry(
-        &self,
-        messages: &[Message],
-        tools: &[ToolSchema],
-        on_event: &mut impl FnMut(Event),
-    ) -> Result<Message, ProviderError> {
-        let mut delay = self.retry_delay;
-        let mut last_error = ProviderError::fatal("no attempts made");
-        for attempt in 0..self.max_attempts {
-            if attempt > 0 {
-                std::thread::sleep(delay);
-                delay *= 2;
-            }
-            let mut emitted = false;
-            let result =
-                self.provider
-                    .complete_stream(&self.system, messages, tools, &mut |text| {
-                        emitted = true;
-                        on_event(Event::AssistantDelta(text));
-                    });
-            match result {
-                Ok(reply) => return Ok(reply),
-                // Retrying a fatal error (bad request, auth) wastes time and
-                // money, and retrying after text reached the user would
-                // duplicate output. Only clean transient failures try again.
-                Err(e) if !e.retryable || emitted => return Err(e),
-                Err(e) => last_error = e,
-            }
-        }
-        Err(last_error)
-    }
 }
 
 #[cfg(test)]
@@ -188,9 +154,7 @@ mod tests {
         provider: &'a ScriptedProvider,
         tools: &'a crate::tools::ToolRegistry,
     ) -> Agent<'a> {
-        let mut agent = Agent::new(provider, tools, "sys".into());
-        agent.retry_delay = Duration::from_millis(1);
-        agent
+        Agent::new(provider, tools, "sys".into())
     }
 
     #[test]
@@ -440,52 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn transient_provider_errors_are_retried() {
+    fn provider_errors_propagate_without_corrupting_the_session() {
         let dir = TempDir::new().unwrap();
         let tools = crate::tools::default_registry(dir.path());
-        let provider = ScriptedProvider::new(vec![
-            Err(ProviderError::transient("HTTP 529: overloaded")),
-            Ok(Message::assistant("recovered", vec![])),
-        ]);
-        let mut session = Session::create(dir.path()).unwrap();
-
-        let answer = agent_fixture(&provider, &tools)
-            .run_turn(&mut session, "hi", |_| {})
-            .unwrap();
-        assert_eq!(answer, "recovered");
-    }
-
-    #[test]
-    fn fatal_provider_errors_are_not_retried() {
-        let dir = TempDir::new().unwrap();
-        let tools = crate::tools::default_registry(dir.path());
-        let provider = ScriptedProvider::new(vec![
-            Err(ProviderError::fatal("HTTP 401: bad key")),
-            Ok(Message::assistant("never reached", vec![])),
-        ]);
+        let provider = ScriptedProvider::new(vec![Err(ProviderError::fatal("HTTP 401: bad key"))]);
         let mut session = Session::create(dir.path()).unwrap();
 
         let error = agent_fixture(&provider, &tools)
             .run_turn(&mut session, "hi", |_| {})
             .unwrap_err();
         assert!(error.message.contains("bad key"));
-        assert_eq!(provider.calls.borrow().len(), 1); // no second attempt
-    }
-
-    #[test]
-    fn exhausted_retries_return_the_last_error() {
-        let dir = TempDir::new().unwrap();
-        let tools = crate::tools::default_registry(dir.path());
-        let provider = ScriptedProvider::new(vec![
-            Err(ProviderError::transient("boom 1")),
-            Err(ProviderError::transient("boom 2")),
-            Err(ProviderError::transient("boom 3")),
-        ]);
-        let mut session = Session::create(dir.path()).unwrap();
-
-        let error = agent_fixture(&provider, &tools)
-            .run_turn(&mut session, "hi", |_| {})
-            .unwrap_err();
-        assert!(error.message.contains("boom 3"));
+        // The user's message is persisted even when the turn fails.
+        assert_eq!(Session::open(&session.path).unwrap().messages.len(), 1);
     }
 }

@@ -165,6 +165,81 @@ pub trait Provider {
     }
 }
 
+/// Wraps any provider with retry-on-transient-error and exponential backoff,
+/// so every consumer (agent loop, refine engine) gets resilience from the
+/// transport instead of re-implementing it. Streaming calls retry only while
+/// nothing has been emitted — retrying after text reached the user would
+/// duplicate output.
+pub struct RetryingProvider {
+    pub inner: Box<dyn Provider>,
+    /// Total attempts per call (1 = no retry).
+    pub max_attempts: u32,
+    /// Base delay between retries; doubles each attempt.
+    pub retry_delay: std::time::Duration,
+}
+
+impl RetryingProvider {
+    pub fn new(inner: Box<dyn Provider>) -> Self {
+        Self {
+            inner,
+            max_attempts: 3,
+            retry_delay: std::time::Duration::from_secs(1),
+        }
+    }
+
+    /// Run `call` until it succeeds, is fatal, aborts, or attempts run out.
+    /// `call` returns the result plus whether retrying is no longer safe.
+    fn retry<T>(
+        &self,
+        mut call: impl FnMut() -> (Result<T, ProviderError>, bool),
+    ) -> Result<T, ProviderError> {
+        let mut delay = self.retry_delay;
+        for attempt in 1.. {
+            if attempt > 1 {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            let (result, abort) = call();
+            match result {
+                Ok(value) => return Ok(value),
+                Err(e) if !e.retryable || abort || attempt >= self.max_attempts => return Err(e),
+                Err(_) => {}
+            }
+        }
+        unreachable!("retry loop always returns")
+    }
+}
+
+impl Provider for RetryingProvider {
+    fn complete(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<Message, ProviderError> {
+        self.retry(|| (self.inner.complete(system, messages, tools), false))
+    }
+
+    fn complete_stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Message, ProviderError> {
+        self.retry(|| {
+            let mut emitted = false;
+            let result = self
+                .inner
+                .complete_stream(system, messages, tools, &mut |text| {
+                    emitted = true;
+                    on_text(text);
+                });
+            (result, emitted)
+        })
+    }
+}
+
 fn send(
     url: &str,
     headers: &[(String, String)],
@@ -766,6 +841,88 @@ mod tests {
         let headers = provider.headers();
         assert!(headers.contains(&("Authorization".into(), "Bearer oauth-tok".into())));
         assert!(!headers.iter().any(|(name, _)| name == "x-api-key"));
+    }
+
+    fn retrying(script: Vec<Result<Message, ProviderError>>) -> RetryingProvider {
+        let mut provider =
+            RetryingProvider::new(Box::new(test_support::ScriptedProvider::new(script)));
+        provider.retry_delay = std::time::Duration::from_millis(1);
+        provider
+    }
+
+    #[test]
+    fn retrying_provider_retries_transient_errors() {
+        let provider = retrying(vec![
+            Err(ProviderError::transient("HTTP 529: overloaded")),
+            Ok(Message::assistant("recovered", vec![])),
+        ]);
+        let reply = provider
+            .complete("sys", &[Message::user("hi")], &[])
+            .unwrap();
+        assert_eq!(reply.content, "recovered");
+    }
+
+    #[test]
+    fn retrying_provider_gives_up_on_fatal_errors() {
+        let provider = retrying(vec![
+            Err(ProviderError::fatal("HTTP 401: bad key")),
+            Ok(Message::assistant("never reached", vec![])),
+        ]);
+        let error = provider
+            .complete("sys", &[Message::user("hi")], &[])
+            .unwrap_err();
+        assert!(error.message.contains("bad key"));
+    }
+
+    #[test]
+    fn retrying_provider_returns_the_last_error_when_exhausted() {
+        let provider = retrying(vec![
+            Err(ProviderError::transient("boom 1")),
+            Err(ProviderError::transient("boom 2")),
+            Err(ProviderError::transient("boom 3")),
+        ]);
+        let error = provider
+            .complete("sys", &[Message::user("hi")], &[])
+            .unwrap_err();
+        assert!(error.message.contains("boom 3"));
+    }
+
+    #[test]
+    fn retrying_provider_never_retries_after_text_was_emitted() {
+        // The scripted mock's default complete_stream emits the full text on
+        // success only; simulate a mid-stream failure with a custom inner.
+        struct EmitsThenFails;
+        impl Provider for EmitsThenFails {
+            fn complete(
+                &self,
+                _system: &str,
+                _messages: &[Message],
+                _tools: &[ToolSchema],
+            ) -> Result<Message, ProviderError> {
+                unreachable!("streaming only")
+            }
+
+            fn complete_stream(
+                &self,
+                _system: &str,
+                _messages: &[Message],
+                _tools: &[ToolSchema],
+                on_text: &mut dyn FnMut(&str),
+            ) -> Result<Message, ProviderError> {
+                on_text("partial output");
+                Err(ProviderError::transient("stream cut off"))
+            }
+        }
+        let mut provider = RetryingProvider::new(Box::new(EmitsThenFails));
+        provider.retry_delay = std::time::Duration::from_millis(1);
+        let mut streamed = String::new();
+        let error = provider
+            .complete_stream("sys", &[Message::user("hi")], &[], &mut |t| {
+                streamed.push_str(t)
+            })
+            .unwrap_err();
+        assert!(error.message.contains("cut off"));
+        assert_eq!(streamed, "partial output"); // exactly once — no retry
     }
 
     #[test]

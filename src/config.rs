@@ -4,7 +4,7 @@
 //! `BRIDGENT_BASE_URL`, and the provider key (`ANTHROPIC_API_KEY` or
 //! `OPENAI_API_KEY`). Flags override env; env overrides defaults.
 
-use crate::providers::{AnthropicProvider, OpenAIProvider, Provider};
+use crate::providers::{AnthropicProvider, OpenAIProvider, Provider, RetryingProvider};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -112,8 +112,9 @@ impl Config {
         })
     }
 
+    /// The configured provider, wrapped with transient-error retry.
     pub fn build_provider(&self) -> Box<dyn Provider> {
-        match self.provider {
+        let inner: Box<dyn Provider> = match self.provider {
             ProviderKind::Anthropic => {
                 let mut p = AnthropicProvider::new(&self.api_key, &self.model);
                 p.auth_token = self.auth_token.clone();
@@ -129,7 +130,8 @@ impl Config {
                 }
                 Box::new(p)
             }
-        }
+        };
+        Box::new(RetryingProvider::new(inner))
     }
 }
 
