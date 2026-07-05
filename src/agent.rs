@@ -34,6 +34,26 @@ pub enum Event<'a> {
     },
 }
 
+impl Event<'_> {
+    /// The event's JSONL form — the machine contract for headless consumers
+    /// (`bridgent --json`), kept beside the type it describes.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Event::AssistantDelta(text) => json!({"type": "delta", "text": text}),
+            Event::AssistantText(text) => json!({"type": "text", "text": text}),
+            Event::ToolStart(call) => json!({
+                "type": "tool_start", "id": call.id, "name": call.name, "args": call.args,
+            }),
+            Event::ToolEnd(call, result) => json!({
+                "type": "tool_end", "id": call.id, "is_error": result.is_error,
+                "output": result.output,
+            }),
+            Event::Compacted { kept } => json!({"type": "compacted", "kept": kept}),
+        }
+    }
+}
+
 pub struct Agent<'a> {
     pub provider: &'a dyn Provider,
     pub tools: &'a ToolRegistry,

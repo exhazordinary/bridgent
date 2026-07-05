@@ -114,8 +114,8 @@ impl PythonRunner {
         let output = result.map_err(|e| e.to_string())?;
         if output.exit_code != Some(0) {
             // The tail of stderr carries the actual exception.
-            let tail: Vec<&str> = output.stderr.lines().rev().take(5).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            let lines: Vec<&str> = output.stderr.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(5)..];
             return Err(format!("program crashed:\n{}", tail.join("\n")));
         }
         serde_json::from_str(output.stdout.trim())
@@ -142,16 +142,32 @@ pub fn cell_accuracy(expected: &Grid, got: &Grid) -> f64 {
     matching as f64 / total as f64
 }
 
+/// Extract the input grids from a list of pairs.
+fn inputs(pairs: &[Pair]) -> Vec<Grid> {
+    pairs.iter().map(|p| p.input.clone()).collect()
+}
+
 /// Verifies candidate programs against the task's training pairs.
 pub struct TrainVerifier<'a> {
-    pub train: &'a [Pair],
-    pub runner: PythonRunner,
+    train: &'a [Pair],
+    /// Training inputs, precomputed once — verification runs per candidate.
+    inputs: Vec<Grid>,
+    runner: PythonRunner,
+}
+
+impl<'a> TrainVerifier<'a> {
+    pub fn new(train: &'a [Pair]) -> Self {
+        Self {
+            train,
+            inputs: inputs(train),
+            runner: PythonRunner::default(),
+        }
+    }
 }
 
 impl Verifier for TrainVerifier<'_> {
     fn verify(&self, candidate: &str) -> Verdict {
-        let inputs: Vec<Grid> = self.train.iter().map(|p| p.input.clone()).collect();
-        let outputs = match self.runner.run(candidate, &inputs) {
+        let outputs = match self.runner.run(candidate, &self.inputs) {
             Ok(outputs) => outputs,
             Err(e) => {
                 return Verdict {
@@ -222,15 +238,11 @@ pub fn solve(
     config: RefineConfig,
     on_event: impl FnMut(RefineEvent),
 ) -> Result<Solution, String> {
-    let verifier = TrainVerifier {
-        train: &task.train,
-        runner: PythonRunner::default(),
-    };
+    let verifier = TrainVerifier::new(&task.train);
     let pool = refine(provider, &base_prompt(task), &verifier, config, on_event)
         .map_err(|e| e.to_string())?;
     let best: &Candidate = pool.first().ok_or("no candidates generated")?;
-    let test_inputs: Vec<Grid> = task.test.iter().map(|p| p.input.clone()).collect();
-    let predictions = PythonRunner::default().run(&best.content, &test_inputs)?;
+    let predictions = PythonRunner::default().run(&best.content, &inputs(&task.test))?;
     Ok(Solution {
         predictions,
         program: best.content.clone(),
@@ -328,10 +340,7 @@ mod tests {
     #[test]
     fn train_verifier_scores_and_builds_diff_feedback() {
         let task = identity_task();
-        let verifier = TrainVerifier {
-            train: &task.train,
-            runner: PythonRunner::default(),
-        };
+        let verifier = TrainVerifier::new(&task.train);
 
         let perfect = verifier.verify("def transform(grid):\n    return grid");
         assert_eq!(perfect.score, 1.0);

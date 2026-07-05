@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::providers::Message;
+use crate::providers::{Message, Usage};
 
 pub struct Session {
     pub path: PathBuf,
@@ -37,16 +37,23 @@ impl Session {
     /// a corrupt tail never blocks a resume.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let reader = BufReader::new(File::open(path)?);
-        let messages = reader
-            .lines()
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+        let mut messages = Vec::new();
+        for line in reader.lines() {
+            messages.extend(serde_json::from_str::<Message>(&line?).ok());
+        }
         Ok(Self {
             path: path.to_path_buf(),
             messages,
         })
+    }
+
+    /// Total tokens across every message still in the session.
+    pub fn usage(&self) -> Usage {
+        let mut total = Usage::default();
+        for usage in self.messages.iter().filter_map(|m| m.usage) {
+            total.add(usage);
+        }
+        total
     }
 
     /// All session files in `workdir`, oldest first.

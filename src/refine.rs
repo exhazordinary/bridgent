@@ -67,9 +67,13 @@ pub fn refine(
 ) -> Result<Vec<Candidate>, ProviderError> {
     let mut pool: Vec<Candidate> = Vec::new();
     for round in 0..config.rounds {
-        let prompt = build_prompt(base_prompt, &pool, config.keep_top);
+        let seed = [Message::user(build_prompt(
+            base_prompt,
+            &pool,
+            config.keep_top,
+        ))];
         for _ in 0..config.per_round {
-            let reply = provider.complete("", &[Message::user(prompt.clone())], &[])?;
+            let reply = provider.complete("", &seed, &[])?;
             let content = extract_code(&reply.content);
             let verdict = verifier.verify(&content);
             let solved = verdict.score >= 1.0;
@@ -92,9 +96,10 @@ pub fn refine(
 
 fn rank(pool: &mut [Candidate]) {
     pool.sort_by(|a, b| {
-        (b.verdict.score, b.verdict.secondary)
-            .partial_cmp(&(a.verdict.score, a.verdict.secondary))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.verdict
+            .score
+            .total_cmp(&a.verdict.score)
+            .then(b.verdict.secondary.total_cmp(&a.verdict.secondary))
     });
 }
 
@@ -126,7 +131,7 @@ fn build_prompt(base: &str, pool: &[Candidate], keep_top: usize) -> String {
 /// markdown fences and often lead with reasoning. Falls back to the whole
 /// reply when there is no fence.
 pub fn extract_code(reply: &str) -> String {
-    let mut blocks = Vec::new();
+    let mut last: Option<&str> = None;
     let mut rest = reply;
     while let Some(start) = rest.find("```") {
         let after_fence = &rest[start + 3..];
@@ -134,10 +139,10 @@ pub fn extract_code(reply: &str) -> String {
         let Some(end) = after_fence[body_start..].find("```") else {
             break;
         };
-        blocks.push(after_fence[body_start..body_start + end].trim().to_string());
+        last = Some(after_fence[body_start..body_start + end].trim());
         rest = &after_fence[body_start + end + 3..];
     }
-    blocks.pop().unwrap_or_else(|| reply.trim().to_string())
+    last.unwrap_or_else(|| reply.trim()).to_string()
 }
 
 #[cfg(test)]

@@ -1,16 +1,16 @@
 //! bridgent CLI: one-shot prompts, an interactive REPL, and session resume.
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bridgent::agent::{Agent, Event};
 use bridgent::cli::{self, ProviderFlags};
 use bridgent::config::Config;
 use bridgent::context::system_prompt;
-use bridgent::providers::Usage;
+use bridgent::providers::{Provider, Role};
 use bridgent::session::Session;
-use bridgent::tools::default_registry;
+use bridgent::tools::{default_registry, ToolRegistry};
 
 const USAGE: &str = "\
 bridgent — a minimal, provider-agnostic coding agent
@@ -30,10 +30,11 @@ Options:
   -h, --help              show this help
   -V, --version           show version
 
-In the REPL, /help lists session commands (/new, /compact, /usage).
+In the REPL, /help lists session commands (/new, /compact, /model, /usage).
 
 Environment:
   ANTHROPIC_API_KEY / OPENAI_API_KEY   provider credentials
+  ANTHROPIC_AUTH_TOKEN                 bearer token, replaces the API key
   BRIDGENT_PROVIDER, BRIDGENT_MODEL, BRIDGENT_BASE_URL   defaults for the flags";
 
 #[derive(Default)]
@@ -79,30 +80,13 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     Ok(Some(args))
 }
 
-/// Total tokens across every message in the session.
-fn session_usage(session: &Session) -> Usage {
-    let mut total = Usage::default();
-    for usage in session.messages.iter().filter_map(|m| m.usage) {
-        total.add(usage);
+/// First `n` characters of `s`, with an ellipsis when truncated.
+fn truncate_chars(s: &str, n: usize) -> String {
+    let mut out: String = s.chars().take(n).collect();
+    if out.len() < s.len() {
+        out.push('…');
     }
-    total
-}
-
-/// One JSONL line per event, for `--json` headless consumers.
-fn print_json_event(event: Event) {
-    let value = match event {
-        Event::AssistantDelta(text) => serde_json::json!({"type": "delta", "text": text}),
-        Event::AssistantText(text) => serde_json::json!({"type": "text", "text": text}),
-        Event::ToolStart(call) => serde_json::json!({
-            "type": "tool_start", "id": call.id, "name": call.name, "args": call.args,
-        }),
-        Event::ToolEnd(call, result) => serde_json::json!({
-            "type": "tool_end", "id": call.id, "is_error": result.is_error,
-            "output": result.output,
-        }),
-        Event::Compacted { kept } => serde_json::json!({"type": "compacted", "kept": kept}),
-    };
-    println!("{value}");
+    out
 }
 
 /// Render agent progress to stderr so stdout stays clean for the answer.
@@ -115,12 +99,11 @@ fn print_event(event: Event) {
         Event::AssistantText(_) => {}
         Event::ToolStart(call) => {
             let args = serde_json::to_string(&call.args).unwrap_or_default();
-            let args = if args.len() > 120 {
-                format!("{}…", &args[..120])
-            } else {
-                args
-            };
-            eprintln!("\x1b[2m⚙ {} {args}\x1b[0m", call.name);
+            eprintln!(
+                "\x1b[2m⚙ {} {}\x1b[0m",
+                call.name,
+                truncate_chars(&args, 120)
+            );
         }
         Event::ToolEnd(_, result) if result.is_error => {
             let first = result.output.lines().next().unwrap_or_default();
@@ -129,6 +112,184 @@ fn print_event(event: Event) {
         Event::ToolEnd(..) => {}
         Event::Compacted { kept } => {
             eprintln!("\x1b[2m⊜ history compacted to {kept} messages\x1b[0m");
+        }
+    }
+}
+
+fn list_sessions(workdir: &Path) {
+    let paths = Session::list(workdir);
+    if paths.is_empty() {
+        eprintln!("no sessions in {}", workdir.display());
+    }
+    for path in paths {
+        match Session::open(&path) {
+            Ok(session) => {
+                let first = session
+                    .messages
+                    .iter()
+                    .find(|m| m.role == Role::User)
+                    .map_or("(empty)", |m| m.content.as_str());
+                println!(
+                    "{}  {} msgs  {}",
+                    path.display(),
+                    session.messages.len(),
+                    truncate_chars(first, 60)
+                );
+            }
+            Err(e) => eprintln!("{}  (unreadable: {e})", path.display()),
+        }
+    }
+}
+
+/// Run one prompt to completion, as text or as JSONL events.
+fn run_one_shot(repl: &mut Repl, prompt: &str, json: bool) -> Result<(), String> {
+    if json {
+        // Headless mode: JSONL events on stdout, a final done record with
+        // the session's token totals, machine-readable errors.
+        match agent(repl.provider.as_ref(), &repl.tools, &repl.system).run_turn(
+            &mut repl.session,
+            prompt,
+            |event| {
+                println!("{}", event.to_json());
+            },
+        ) {
+            Ok(answer) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "done", "answer": answer,
+                        "usage": repl.session.usage(),
+                        "session": repl.session.path,
+                    })
+                );
+                Ok(())
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"type": "error", "message": e.to_string()})
+                );
+                Err(e.to_string())
+            }
+        }
+    } else {
+        // The answer streams through print_event; just terminate the line.
+        agent(repl.provider.as_ref(), &repl.tools, &repl.system)
+            .run_turn(&mut repl.session, prompt, print_event)
+            .map_err(|e| e.to_string())?;
+        println!();
+        Ok(())
+    }
+}
+
+/// Interactive state: everything a turn or a slash command needs.
+struct Repl {
+    config: Config,
+    provider: Box<dyn Provider>,
+    tools: ToolRegistry,
+    system: String,
+    session: Session,
+    workdir: PathBuf,
+}
+
+/// Agents are cheap bundles of borrows, rebuilt per use so `/model` can swap
+/// the provider between turns. A free function (not a `Repl` method) so the
+/// borrow of these fields stays disjoint from `&mut repl.session`.
+fn agent<'a>(provider: &'a dyn Provider, tools: &'a ToolRegistry, system: &str) -> Agent<'a> {
+    Agent::new(provider, tools, system.to_string())
+}
+
+impl Repl {
+    fn run(&mut self) -> Result<(), String> {
+        eprintln!(
+            "bridgent {} · {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            self.config.model,
+            self.workdir.display()
+        );
+        eprintln!("empty line or ctrl-d to exit\n");
+        let stdin = std::io::stdin();
+        loop {
+            eprint!("\x1b[1m>\x1b[0m ");
+            std::io::stderr().flush().ok();
+            let mut line = String::new();
+            if stdin
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Ok(()); // EOF
+            }
+            let input = line.trim();
+            if input.is_empty() {
+                return Ok(());
+            }
+            if let Some(command) = input.strip_prefix('/') {
+                match self.command(command) {
+                    Ok(output) => eprintln!("{output}\n"),
+                    Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
+                }
+                continue;
+            }
+            match agent(self.provider.as_ref(), &self.tools, &self.system).run_turn(
+                &mut self.session,
+                input,
+                print_event,
+            ) {
+                Ok(_) => println!("\n"), // answer already streamed
+                // Provider errors don't kill the REPL; the session is intact.
+                Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
+            }
+        }
+    }
+
+    /// Slash commands. Everything else in the loop goes to the model.
+    fn command(&mut self, command: &str) -> Result<String, String> {
+        let (name, arg) = command
+            .split_once(' ')
+            .map_or((command, ""), |(c, rest)| (c, rest.trim()));
+        match (name, arg) {
+            ("help", _) => Ok("/new           start a fresh session\n\
+                          /compact       summarize old history to reclaim context\n\
+                          /model [ID]    show or switch the model\n\
+                          /usage         token totals for this session\n\
+                          /help          this text"
+                .into()),
+            ("new", _) => {
+                self.session = Session::create(&self.workdir).map_err(|e| e.to_string())?;
+                Ok("started a fresh session".into())
+            }
+            ("compact", _) => {
+                let agent = agent(self.provider.as_ref(), &self.tools, &self.system);
+                if agent
+                    .compact(&mut self.session)
+                    .map_err(|e| e.to_string())?
+                {
+                    Ok(format!(
+                        "history compacted to {} messages",
+                        self.session.messages.len()
+                    ))
+                } else {
+                    Ok("nothing to compact yet".into())
+                }
+            }
+            ("model", "") => Ok(format!("current model: {}", self.config.model)),
+            ("model", id) => {
+                self.config.model = id.to_string();
+                self.provider = self.config.build_provider();
+                Ok(format!("switched to {id}"))
+            }
+            ("usage", _) => {
+                let total = self.session.usage();
+                Ok(format!(
+                    "session: {} messages · {} input + {} output tokens",
+                    self.session.messages.len(),
+                    total.input_tokens,
+                    total.output_tokens
+                ))
+            }
+            (other, _) => Err(format!("unknown command /{other} (try /help)")),
         }
     }
 }
@@ -143,37 +304,12 @@ fn run() -> Result<(), String> {
         std::env::current_dir().map_err(|e| format!("cannot resolve working directory: {e}"))?;
 
     if args.list_sessions {
-        let paths = Session::list(&workdir);
-        if paths.is_empty() {
-            eprintln!("no sessions in {}", workdir.display());
-        }
-        for path in paths {
-            match Session::open(&path) {
-                Ok(session) => {
-                    let first = session
-                        .messages
-                        .iter()
-                        .find(|m| m.role == bridgent::providers::Role::User)
-                        .map_or("(empty)", |m| m.content.as_str());
-                    let first: String = first.chars().take(60).collect();
-                    println!(
-                        "{}  {} msgs  {first}",
-                        path.display(),
-                        session.messages.len()
-                    );
-                }
-                Err(e) => eprintln!("{}  (unreadable: {e})", path.display()),
-            }
-        }
+        list_sessions(&workdir);
         return Ok(());
     }
 
-    let mut config = Config::from_env(&args.flags)?;
-    let mut provider = config.build_provider();
-    let tools = default_registry(&workdir);
-    let system = system_prompt(&workdir);
-
-    let mut session = match (&args.resume_path, args.resume) {
+    let config = Config::from_env(&args.flags)?;
+    let session = match (&args.resume_path, args.resume) {
         (Some(path), _) => {
             Session::open(path).map_err(|e| format!("cannot resume session: {e}"))?
         }
@@ -185,143 +321,18 @@ fn run() -> Result<(), String> {
             Session::create(&workdir).map_err(|e| format!("cannot create session: {e}"))?
         }
     };
+    let mut repl = Repl {
+        provider: config.build_provider(),
+        tools: default_registry(&workdir),
+        system: system_prompt(&workdir),
+        session,
+        config,
+        workdir,
+    };
 
-    if let Some(prompt) = args.prompt {
-        let agent = Agent::new(provider.as_ref(), &tools, system);
-        if args.json {
-            // Headless mode: JSONL events, machine-readable errors, and a
-            // final done record with the session's token totals.
-            match agent.run_turn(&mut session, &prompt, print_json_event) {
-                Ok(answer) => {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "type": "done", "answer": answer,
-                            "usage": session_usage(&session),
-                            "session": session.path,
-                        })
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    println!(
-                        "{}",
-                        serde_json::json!({"type": "error", "message": e.to_string()})
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-        // The answer streams through print_event; just terminate the line.
-        agent
-            .run_turn(&mut session, &prompt, print_event)
-            .map_err(|e| e.to_string())?;
-        println!();
-        return Ok(());
-    }
-
-    eprintln!(
-        "bridgent {} · {} · {}",
-        env!("CARGO_PKG_VERSION"),
-        config.model,
-        workdir.display()
-    );
-    eprintln!("empty line or ctrl-d to exit\n");
-    let stdin = std::io::stdin();
-    loop {
-        eprint!("\x1b[1m>\x1b[0m ");
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        if stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?
-            == 0
-        {
-            return Ok(()); // EOF
-        }
-        let input = line.trim();
-        if input.is_empty() {
-            return Ok(());
-        }
-        // The agent is rebuilt per turn (it's just borrows) so /model can
-        // swap the provider between turns.
-        if let Some(command) = input.strip_prefix('/') {
-            let result = run_command(
-                command,
-                &mut config,
-                &mut provider,
-                &tools,
-                &system,
-                &mut session,
-                &workdir,
-            );
-            match result {
-                Ok(output) => eprintln!("{output}\n"),
-                Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
-            }
-            continue;
-        }
-        let agent = Agent::new(provider.as_ref(), &tools, system.clone());
-        match agent.run_turn(&mut session, input, print_event) {
-            Ok(_) => println!("\n"), // answer already streamed
-            // Provider errors don't kill the REPL; the session file is intact.
-            Err(e) => eprintln!("\x1b[31m{e}\x1b[0m\n"),
-        }
-    }
-}
-
-/// REPL slash commands. Everything else in the loop goes to the model.
-#[allow(clippy::too_many_arguments)]
-fn run_command(
-    command: &str,
-    config: &mut Config,
-    provider: &mut Box<dyn bridgent::providers::Provider>,
-    tools: &bridgent::tools::ToolRegistry,
-    system: &str,
-    session: &mut Session,
-    workdir: &std::path::Path,
-) -> Result<String, String> {
-    match command
-        .split_once(' ')
-        .map_or((command, ""), |(c, rest)| (c, rest.trim()))
-    {
-        ("help", _) => Ok("/new           start a fresh session\n\
-                      /compact       summarize old history to reclaim context\n\
-                      /model [ID]    show or switch the model\n\
-                      /usage         token totals for this session\n\
-                      /help          this text"
-            .into()),
-        ("new", _) => {
-            *session = Session::create(workdir).map_err(|e| e.to_string())?;
-            Ok("started a fresh session".into())
-        }
-        ("compact", _) => {
-            let agent = Agent::new(provider.as_ref(), tools, system.to_string());
-            match agent.compact(session).map_err(|e| e.to_string())? {
-                true => Ok(format!(
-                    "history compacted to {} messages",
-                    session.messages.len()
-                )),
-                false => Ok("nothing to compact yet".into()),
-            }
-        }
-        ("model", "") => Ok(format!("current model: {}", config.model)),
-        ("model", id) => {
-            config.model = id.to_string();
-            *provider = config.build_provider();
-            Ok(format!("switched to {id}"))
-        }
-        ("usage", _) => {
-            let total = session_usage(session);
-            Ok(format!(
-                "session: {} messages · {} input + {} output tokens",
-                session.messages.len(),
-                total.input_tokens,
-                total.output_tokens
-            ))
-        }
-        (other, _) => Err(format!("unknown command /{other} (try /help)")),
+    match args.prompt {
+        Some(prompt) => run_one_shot(&mut repl, &prompt, args.json),
+        None => repl.run(),
     }
 }
 

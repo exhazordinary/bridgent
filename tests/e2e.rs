@@ -60,7 +60,7 @@ fn fake_server(replies: Vec<Reply>) -> String {
             stream.write_all(response.as_bytes()).unwrap();
         }
     });
-    format!("http://{addr}/v1")
+    format!("http://{addr}")
 }
 
 fn text_response(content: &str) -> Value {

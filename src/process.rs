@@ -56,17 +56,16 @@ pub fn run_with_timeout(
         let _ = stdin.write_all(data);
     }
 
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let mut buf = String::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_string(&mut buf);
-            }
+            let _ = pipe.read_to_string(&mut buf);
             buf
         })
-    };
-    let stdout_thread = drain(child.stdout.take().map(|p| Box::new(p) as _));
-    let stderr_thread = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    }
+    // Both pipes exist: this function always spawns with Stdio::piped().
+    let stdout_thread = drain(child.stdout.take().expect("stdout piped"));
+    let stderr_thread = drain(child.stderr.take().expect("stderr piped"));
 
     let status = match child.wait_timeout(timeout) {
         Ok(Some(status)) => status,
