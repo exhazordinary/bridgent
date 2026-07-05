@@ -35,13 +35,24 @@ impl ToolResult {
     }
 }
 
-/// A callable capability exposed to the model.
+/// A tool's interface in provider-neutral form; each provider maps this to
+/// its own wire format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    /// JSON schema for the tool's arguments.
+    pub parameters: Value,
+}
+
+/// A callable capability exposed to the model. Errors are strings destined
+/// for the model, not the user — say what went wrong and how to correct it.
 pub trait Tool {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     /// JSON schema for the tool's arguments.
     fn parameters(&self) -> Value;
-    fn run(&self, args: &Value) -> ToolResult;
+    fn run(&self, args: &Value) -> Result<String, String>;
 }
 
 /// Holds the tools available to one agent and dispatches calls to them.
@@ -55,23 +66,23 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
-    /// Tool schemas in provider-neutral form (name, description, input_schema).
-    pub fn schemas(&self) -> Vec<Value> {
+    pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools
             .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name(),
-                    "description": t.description(),
-                    "input_schema": t.parameters(),
-                })
+            .map(|tool| ToolSchema {
+                name: tool.name().into(),
+                description: tool.description().into(),
+                parameters: tool.parameters(),
             })
             .collect()
     }
 
     pub fn run(&self, name: &str, args: &Value) -> ToolResult {
         match self.tools.iter().find(|t| t.name() == name) {
-            Some(tool) => tool.run(args),
+            Some(tool) => match tool.run(args) {
+                Ok(output) => ToolResult::ok(output),
+                Err(error) => ToolResult::err(error),
+            },
             None => ToolResult::err(format!("Unknown tool: {name}")),
         }
     }
@@ -96,10 +107,10 @@ fn resolve(workdir: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolResult> {
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| ToolResult::err(format!("Missing required argument: {key}")))
+        .ok_or_else(|| format!("Missing required argument: {key}"))
 }
 
 pub struct ReadTool {
@@ -138,15 +149,10 @@ impl Tool for ReadTool {
         })
     }
 
-    fn run(&self, args: &Value) -> ToolResult {
-        let path = match required_str(args, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let content = match std::fs::read_to_string(resolve(&self.workdir, path)) {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err(format!("Cannot read {path}: {e}")),
-        };
+    fn run(&self, args: &Value) -> Result<String, String> {
+        let path = required_str(args, "path")?;
+        let content = std::fs::read_to_string(resolve(&self.workdir, path))
+            .map_err(|e| format!("Cannot read {path}: {e}"))?;
         let lines: Vec<&str> = content.split_inclusive('\n').collect();
         let offset = args
             .get("offset")
@@ -158,16 +164,16 @@ impl Tool for ReadTool {
             .and_then(Value::as_u64)
             .unwrap_or(Self::MAX_LINES as u64) as usize;
         let start = offset - 1;
-        let selected: String = lines.iter().skip(start).take(limit).copied().collect();
+        let mut output: String = lines.iter().skip(start).take(limit).copied().collect();
         let remaining = lines.len().saturating_sub(start + limit);
         if remaining > 0 {
             let plural = if remaining == 1 { "" } else { "s" };
-            return ToolResult::ok(format!(
-                "{selected}\n[truncated: {remaining} more line{plural}, re-read with offset={}]",
+            output.push_str(&format!(
+                "\n[truncated: {remaining} more line{plural}, re-read with offset={}]",
                 offset + limit
             ));
         }
-        ToolResult::ok(selected)
+        Ok(output)
     }
 }
 
@@ -203,21 +209,16 @@ impl Tool for WriteTool {
         })
     }
 
-    fn run(&self, args: &Value) -> ToolResult {
-        let (path, content) = match (required_str(args, "path"), required_str(args, "content")) {
-            (Ok(p), Ok(c)) => (p, c),
-            (Err(e), _) | (_, Err(e)) => return e,
-        };
+    fn run(&self, args: &Value) -> Result<String, String> {
+        let path = required_str(args, "path")?;
+        let content = required_str(args, "content")?;
         let target = resolve(&self.workdir, path);
         if let Some(parent) = target.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolResult::err(format!("Cannot create directories for {path}: {e}"));
-            }
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create directories for {path}: {e}"))?;
         }
-        match std::fs::write(&target, content) {
-            Ok(()) => ToolResult::ok(format!("Wrote {} bytes to {path}", content.len())),
-            Err(e) => ToolResult::err(format!("Cannot write {path}: {e}")),
-        }
+        std::fs::write(&target, content).map_err(|e| format!("Cannot write {path}: {e}"))?;
+        Ok(format!("Wrote {} bytes to {path}", content.len()))
     }
 }
 
@@ -256,41 +257,30 @@ impl Tool for EditTool {
         })
     }
 
-    fn run(&self, args: &Value) -> ToolResult {
-        let path = match required_str(args, "path") {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let (old, new) = match (
-            required_str(args, "old_string"),
-            required_str(args, "new_string"),
-        ) {
-            (Ok(o), Ok(n)) => (o, n),
-            (Err(e), _) | (_, Err(e)) => return e,
-        };
+    fn run(&self, args: &Value) -> Result<String, String> {
+        let path = required_str(args, "path")?;
+        let old = required_str(args, "old_string")?;
+        let new = required_str(args, "new_string")?;
         let target = resolve(&self.workdir, path);
-        let content = match std::fs::read_to_string(&target) {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err(format!("Cannot read {path}: {e}")),
-        };
+        let content =
+            std::fs::read_to_string(&target).map_err(|e| format!("Cannot read {path}: {e}"))?;
         let count = content.matches(old).count();
         if count == 0 {
-            return ToolResult::err(format!("old_string not found in {path}"));
+            return Err(format!("old_string not found in {path}"));
         }
         let replace_all = args
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if count > 1 && !replace_all {
-            return ToolResult::err(format!(
+            return Err(format!(
                 "old_string matches {count} locations in {path}; add more context \
                  to make it unique, or set replace_all"
             ));
         }
-        match std::fs::write(&target, content.replace(old, new)) {
-            Ok(()) => ToolResult::ok(format!("Replaced {count} occurrence(s) in {path}")),
-            Err(e) => ToolResult::err(format!("Cannot write {path}: {e}")),
-        }
+        std::fs::write(&target, content.replace(old, new))
+            .map_err(|e| format!("Cannot write {path}: {e}"))?;
+        Ok(format!("Replaced {count} occurrence(s) in {path}"))
     }
 }
 
@@ -331,28 +321,22 @@ impl Tool for BashTool {
         })
     }
 
-    fn run(&self, args: &Value) -> ToolResult {
-        let command = match required_str(args, "command") {
-            Ok(c) => c,
-            Err(e) => return e,
-        };
+    fn run(&self, args: &Value) -> Result<String, String> {
+        let command = required_str(args, "command")?;
         let timeout = Duration::from_secs(
             args.get("timeout")
                 .and_then(Value::as_u64)
                 .unwrap_or(Self::DEFAULT_TIMEOUT_SECS),
         );
-        let result = run_with_timeout(
+        let process = run_with_timeout(
             Command::new("sh")
                 .arg("-c")
                 .arg(command)
                 .current_dir(&self.workdir),
             None,
             timeout,
-        );
-        let process = match result {
-            Ok(process) => process,
-            Err(e) => return ToolResult::err(e.to_string()),
-        };
+        )
+        .map_err(|e| e.to_string())?;
         let mut output = process.stdout;
         output.push_str(&process.stderr);
         if output.len() > Self::MAX_OUTPUT_CHARS {
@@ -367,8 +351,8 @@ impl Tool for BashTool {
             output.push_str("[no output]");
         }
         match process.exit_code {
-            Some(0) => ToolResult::ok(output),
-            code => ToolResult::err(format!(
+            Some(0) => Ok(output),
+            code => Err(format!(
                 "{output}\n[exit code {}]",
                 code.map_or_else(|| "killed by signal".to_string(), |c| c.to_string())
             )),
@@ -389,11 +373,7 @@ mod tests {
     fn registry_dispatches_and_reports_unknown_tools() {
         let dir = workdir();
         let registry = default_registry(dir.path());
-        let names: Vec<String> = registry
-            .schemas()
-            .iter()
-            .map(|s| s["name"].as_str().unwrap().to_string())
-            .collect();
+        let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["read", "write", "edit", "bash"]);
 
         let result = registry.run("nope", &json!({}));
@@ -402,54 +382,75 @@ mod tests {
     }
 
     #[test]
+    fn registry_converts_tool_results() {
+        let dir = workdir();
+        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+        let registry = default_registry(dir.path());
+
+        let ok = registry.run("read", &json!({"path": "a.txt"}));
+        assert!(!ok.is_error);
+        assert_eq!(ok.output, "hi");
+
+        let err = registry.run("read", &json!({"path": "nope.txt"}));
+        assert!(err.is_error);
+        assert!(err.output.contains("nope.txt"));
+    }
+
+    #[test]
     fn read_returns_file_contents() {
         let dir = workdir();
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
-        let result = ReadTool::new(dir.path()).run(&json!({"path": "a.txt"}));
-        assert!(!result.is_error);
-        assert_eq!(result.output, "hello\nworld\n");
+        let output = ReadTool::new(dir.path())
+            .run(&json!({"path": "a.txt"}))
+            .unwrap();
+        assert_eq!(output, "hello\nworld\n");
     }
 
     #[test]
     fn read_missing_file_is_error() {
         let dir = workdir();
-        let result = ReadTool::new(dir.path()).run(&json!({"path": "nope.txt"}));
-        assert!(result.is_error);
-        assert!(result.output.contains("nope.txt"));
+        let error = ReadTool::new(dir.path())
+            .run(&json!({"path": "nope.txt"}))
+            .unwrap_err();
+        assert!(error.contains("nope.txt"));
     }
 
     #[test]
     fn read_offset_and_limit_page_through_lines() {
         let dir = workdir();
         std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\n").unwrap();
-        let result =
-            ReadTool::new(dir.path()).run(&json!({"path": "a.txt", "offset": 2, "limit": 2}));
-        assert!(result.output.starts_with("l2\nl3\n"));
-        assert!(result.output.contains("1 more line"));
-        assert!(result.output.contains("offset=4"));
+        let output = ReadTool::new(dir.path())
+            .run(&json!({"path": "a.txt", "offset": 2, "limit": 2}))
+            .unwrap();
+        assert!(output.starts_with("l2\nl3\n"));
+        assert!(output.contains("1 more line"));
+        assert!(output.contains("offset=4"));
     }
 
     #[test]
     fn read_truncates_long_files_with_notice() {
         let dir = workdir();
         std::fs::write(dir.path().join("big.txt"), "x\n".repeat(5000)).unwrap();
-        let result = ReadTool::new(dir.path()).run(&json!({"path": "big.txt"}));
-        assert!(result.output.contains("truncated"));
-        assert!(result.output.contains("3000 more lines"));
+        let output = ReadTool::new(dir.path())
+            .run(&json!({"path": "big.txt"}))
+            .unwrap();
+        assert!(output.contains("truncated"));
+        assert!(output.contains("3000 more lines"));
     }
 
     #[test]
     fn write_creates_parents_and_overwrites() {
         let dir = workdir();
         let tool = WriteTool::new(dir.path());
-        let result = tool.run(&json!({"path": "a/b/c.txt", "content": "deep"}));
-        assert!(!result.is_error);
+        tool.run(&json!({"path": "a/b/c.txt", "content": "deep"}))
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
             "deep"
         );
 
-        tool.run(&json!({"path": "a/b/c.txt", "content": "new"}));
+        tool.run(&json!({"path": "a/b/c.txt", "content": "new"}))
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
             "new"
@@ -460,9 +461,9 @@ mod tests {
     fn edit_replaces_unique_string() {
         let dir = workdir();
         std::fs::write(dir.path().join("f.py"), "a = 1\nb = 2\n").unwrap();
-        let result = EditTool::new(dir.path())
-            .run(&json!({"path": "f.py", "old_string": "b = 2", "new_string": "b = 3"}));
-        assert!(!result.is_error);
+        EditTool::new(dir.path())
+            .run(&json!({"path": "f.py", "old_string": "b = 2", "new_string": "b = 3"}))
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.py")).unwrap(),
             "a = 1\nb = 3\n"
@@ -475,23 +476,26 @@ mod tests {
         std::fs::write(dir.path().join("f.py"), "x\nx\n").unwrap();
         let tool = EditTool::new(dir.path());
 
-        let missing = tool.run(&json!({"path": "f.py", "old_string": "zzz", "new_string": "y"}));
-        assert!(missing.is_error);
-        assert!(missing.output.contains("not found"));
+        let missing = tool
+            .run(&json!({"path": "f.py", "old_string": "zzz", "new_string": "y"}))
+            .unwrap_err();
+        assert!(missing.contains("not found"));
 
-        let ambiguous = tool.run(&json!({"path": "f.py", "old_string": "x", "new_string": "y"}));
-        assert!(ambiguous.is_error);
-        assert!(ambiguous.output.contains("2 locations"));
+        let ambiguous = tool
+            .run(&json!({"path": "f.py", "old_string": "x", "new_string": "y"}))
+            .unwrap_err();
+        assert!(ambiguous.contains("2 locations"));
     }
 
     #[test]
     fn edit_replace_all_replaces_every_occurrence() {
         let dir = workdir();
         std::fs::write(dir.path().join("f.py"), "x\nx\n").unwrap();
-        let result = EditTool::new(dir.path()).run(
-            &json!({"path": "f.py", "old_string": "x", "new_string": "y", "replace_all": true}),
-        );
-        assert!(!result.is_error);
+        EditTool::new(dir.path())
+            .run(&json!({
+                "path": "f.py", "old_string": "x", "new_string": "y", "replace_all": true,
+            }))
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.py")).unwrap(),
             "y\ny\n"
@@ -502,40 +506,44 @@ mod tests {
     fn bash_runs_in_workdir_and_captures_output() {
         let dir = workdir();
         std::fs::write(dir.path().join("marker.txt"), "here").unwrap();
-        let result = BashTool::new(dir.path()).run(&json!({"command": "ls"}));
-        assert!(!result.is_error);
-        assert!(result.output.contains("marker.txt"));
+        let output = BashTool::new(dir.path())
+            .run(&json!({"command": "ls"}))
+            .unwrap();
+        assert!(output.contains("marker.txt"));
     }
 
     #[test]
     fn bash_nonzero_exit_is_error_with_code() {
         let dir = workdir();
-        let result = BashTool::new(dir.path()).run(&json!({"command": "exit 3"}));
-        assert!(result.is_error);
-        assert!(result.output.contains("exit code 3"));
+        let error = BashTool::new(dir.path())
+            .run(&json!({"command": "exit 3"}))
+            .unwrap_err();
+        assert!(error.contains("exit code 3"));
     }
 
     #[test]
     fn bash_timeout_kills_command() {
         let dir = workdir();
-        let result = BashTool::new(dir.path()).run(&json!({"command": "sleep 5", "timeout": 1}));
-        assert!(result.is_error);
-        assert!(result.output.contains("timed out"));
+        let error = BashTool::new(dir.path())
+            .run(&json!({"command": "sleep 5", "timeout": 1}))
+            .unwrap_err();
+        assert!(error.contains("timed out"));
     }
 
     #[test]
     fn bash_output_is_capped() {
         let dir = workdir();
-        let result = BashTool::new(dir.path()).run(&json!({"command": "yes | head -c 1000000"}));
-        assert!(result.output.len() <= BashTool::MAX_OUTPUT_CHARS + 100);
-        assert!(result.output.contains("[truncated]"));
+        let output = BashTool::new(dir.path())
+            .run(&json!({"command": "yes | head -c 1000000"}))
+            .unwrap();
+        assert!(output.len() <= BashTool::MAX_OUTPUT_CHARS + 100);
+        assert!(output.contains("[truncated]"));
     }
 
     #[test]
     fn missing_required_argument_is_error() {
         let dir = workdir();
-        let result = ReadTool::new(dir.path()).run(&json!({}));
-        assert!(result.is_error);
-        assert!(result.output.contains("path"));
+        let error = ReadTool::new(dir.path()).run(&json!({})).unwrap_err();
+        assert!(error.contains("path"));
     }
 }

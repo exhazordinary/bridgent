@@ -143,7 +143,7 @@ pub fn extract_code(reply: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use crate::tools::ToolSchema;
     use std::cell::RefCell;
 
     struct ScriptedProvider {
@@ -165,7 +165,7 @@ mod tests {
             &self,
             _system: &str,
             messages: &[Message],
-            _tools: &[Value],
+            _tools: &[ToolSchema],
         ) -> Result<Message, ProviderError> {
             self.prompts.borrow_mut().push(messages[0].content.clone());
             let mut replies = self.replies.borrow_mut();

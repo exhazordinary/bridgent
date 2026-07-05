@@ -8,6 +8,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::tools::ToolSchema;
+
 /// One tool invocation requested by the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -130,7 +132,7 @@ pub trait Provider {
         &self,
         system: &str,
         messages: &[Message],
-        tools: &[Value],
+        tools: &[ToolSchema],
     ) -> Result<Message, ProviderError>;
 
     /// Like `complete`, but emits text chunks through `on_text` as they
@@ -140,7 +142,7 @@ pub trait Provider {
         &self,
         system: &str,
         messages: &[Message],
-        tools: &[Value],
+        tools: &[ToolSchema],
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Message, ProviderError> {
         let message = self.complete(system, messages, tools)?;
@@ -232,7 +234,7 @@ pub fn anthropic_build_request(
     max_tokens: u32,
     system: &str,
     messages: &[Message],
-    tools: &[Value],
+    tools: &[ToolSchema],
 ) -> Value {
     let mut out: Vec<Value> = Vec::new();
     for msg in messages {
@@ -271,9 +273,18 @@ pub fn anthropic_build_request(
             _ => out.push(json!({"role": role, "content": blocks})),
         }
     }
+    let mut tools: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+            })
+        })
+        .collect();
     // System and tools are stable across a session; cache_control markers
     // let the API reuse them instead of re-processing every request.
-    let mut tools = tools.to_vec();
     if let Some(last) = tools.last_mut() {
         last["cache_control"] = json!({"type": "ephemeral"});
     }
@@ -313,7 +324,7 @@ impl Provider for AnthropicProvider {
         &self,
         system: &str,
         messages: &[Message],
-        tools: &[Value],
+        tools: &[ToolSchema],
     ) -> Result<Message, ProviderError> {
         let body = anthropic_build_request(&self.model, self.max_tokens, system, messages, tools);
         let response = post(
@@ -328,7 +339,7 @@ impl Provider for AnthropicProvider {
         &self,
         system: &str,
         messages: &[Message],
-        tools: &[Value],
+        tools: &[ToolSchema],
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Message, ProviderError> {
         let mut body =
@@ -379,7 +390,7 @@ pub fn openai_build_request(
     model: &str,
     system: &str,
     messages: &[Message],
-    tools: &[Value],
+    tools: &[ToolSchema],
 ) -> Value {
     let mut out = vec![json!({"role": "system", "content": system})];
     for msg in messages {
@@ -418,9 +429,9 @@ pub fn openai_build_request(
             json!({
                 "type": "function",
                 "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"],
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
                 },
             })
         })
@@ -469,7 +480,7 @@ impl Provider for OpenAIProvider {
         &self,
         system: &str,
         messages: &[Message],
-        tools: &[Value],
+        tools: &[ToolSchema],
     ) -> Result<Message, ProviderError> {
         let body = openai_build_request(&self.model, system, messages, tools);
         let response = post(
@@ -484,7 +495,7 @@ impl Provider for OpenAIProvider {
         &self,
         system: &str,
         messages: &[Message],
-        tools: &[Value],
+        tools: &[ToolSchema],
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Message, ProviderError> {
         let mut body = openai_build_request(&self.model, system, messages, tools);
@@ -510,16 +521,16 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
 
-    fn tools() -> Vec<Value> {
-        vec![json!({
-            "name": "read",
-            "description": "Read a file.",
-            "input_schema": {
+    fn tools() -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            name: "read".into(),
+            description: "Read a file.".into(),
+            parameters: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
-            },
-        })]
+            }),
+        }]
     }
 
     fn history() -> Vec<Message> {

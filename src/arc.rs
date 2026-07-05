@@ -243,7 +243,7 @@ pub fn solve(
 mod tests {
     use super::*;
     use crate::providers::{Message, ProviderError};
-    use serde_json::Value;
+    use crate::tools::ToolSchema;
     use std::cell::RefCell;
 
     /// Identity task: output equals input.
@@ -373,7 +373,7 @@ mod tests {
             &self,
             _system: &str,
             _messages: &[Message],
-            _tools: &[Value],
+            _tools: &[ToolSchema],
         ) -> Result<Message, ProviderError> {
             Ok(Message::assistant(self.0.borrow_mut().remove(0), vec![]))
         }

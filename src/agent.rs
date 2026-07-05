@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::providers::{Message, Provider, ProviderError, Role, ToolCall};
 use crate::session::Session;
+use crate::tools::ToolSchema;
 use crate::tools::{ToolRegistry, ToolResult};
 
 fn history_chars(messages: &[Message]) -> usize {
@@ -146,7 +147,7 @@ impl<'a> Agent<'a> {
     fn complete_with_retry(
         &self,
         messages: &[Message],
-        tools: &[serde_json::Value],
+        tools: &[ToolSchema],
         on_event: &mut impl FnMut(Event),
     ) -> Result<Message, ProviderError> {
         let mut delay = self.retry_delay;
@@ -179,7 +180,7 @@ impl<'a> Agent<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::json;
     use std::cell::RefCell;
     use tempfile::TempDir;
 
@@ -203,7 +204,7 @@ mod tests {
             &self,
             _system: &str,
             messages: &[Message],
-            _tools: &[Value],
+            _tools: &[ToolSchema],
         ) -> Result<Message, ProviderError> {
             self.calls.borrow_mut().push(messages.to_vec());
             self.script.borrow_mut().remove(0)
