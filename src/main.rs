@@ -22,6 +22,7 @@ Options:
   -c, --continue          resume the most recent session
       --resume <PATH>     resume a specific session file (see --sessions)
       --sessions          list sessions in this directory and exit
+      --json              one-shot mode: emit JSONL events instead of text
       --provider <NAME>   anthropic (default) or openai
       --model <MODEL>     model id (default per provider)
       --base-url <URL>    override API base URL (local models, proxies)
@@ -39,6 +40,7 @@ struct Args {
     resume: bool,
     resume_path: Option<PathBuf>,
     list_sessions: bool,
+    json: bool,
     provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
@@ -50,6 +52,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         resume: false,
         resume_path: None,
         list_sessions: false,
+        json: false,
         provider: None,
         model: None,
         base_url: None,
@@ -74,6 +77,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "-c" | "--continue" => args.resume = true,
             "--resume" => args.resume_path = Some(PathBuf::from(flag_value("--resume")?)),
             "--sessions" => args.list_sessions = true,
+            "--json" => args.json = true,
             "--provider" => args.provider = Some(flag_value("--provider")?),
             "--model" => args.model = Some(flag_value("--model")?),
             "--base-url" => args.base_url = Some(flag_value("--base-url")?),
@@ -85,6 +89,32 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
         args.prompt = Some(words.join(" "));
     }
     Ok(Some(args))
+}
+
+/// Total tokens across every message in the session.
+fn session_usage(session: &Session) -> Usage {
+    let mut total = Usage::default();
+    for usage in session.messages.iter().filter_map(|m| m.usage) {
+        total.add(usage);
+    }
+    total
+}
+
+/// One JSONL line per event, for `--json` headless consumers.
+fn print_json_event(event: Event) {
+    let value = match event {
+        Event::AssistantDelta(text) => serde_json::json!({"type": "delta", "text": text}),
+        Event::AssistantText(text) => serde_json::json!({"type": "text", "text": text}),
+        Event::ToolStart(call) => serde_json::json!({
+            "type": "tool_start", "id": call.id, "name": call.name, "args": call.args,
+        }),
+        Event::ToolEnd(call, result) => serde_json::json!({
+            "type": "tool_end", "id": call.id, "is_error": result.is_error,
+            "output": result.output,
+        }),
+        Event::Compacted { kept } => serde_json::json!({"type": "compacted", "kept": kept}),
+    };
+    println!("{value}");
 }
 
 /// Render agent progress to stderr so stdout stays clean for the answer.
@@ -174,8 +204,33 @@ fn run() -> Result<(), String> {
     };
 
     if let Some(prompt) = args.prompt {
+        let agent = Agent::new(provider.as_ref(), &tools, system);
+        if args.json {
+            // Headless mode: JSONL events, machine-readable errors, and a
+            // final done record with the session's token totals.
+            match agent.run_turn(&mut session, &prompt, print_json_event) {
+                Ok(answer) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "done", "answer": answer,
+                            "usage": session_usage(&session),
+                            "session": session.path,
+                        })
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type": "error", "message": e.to_string()})
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         // The answer streams through print_event; just terminate the line.
-        Agent::new(provider.as_ref(), &tools, system)
+        agent
             .run_turn(&mut session, &prompt, print_event)
             .map_err(|e| e.to_string())?;
         println!();
@@ -275,10 +330,7 @@ fn run_command(
             Ok(format!("switched to {id}"))
         }
         ("usage", _) => {
-            let mut total = Usage::default();
-            for usage in session.messages.iter().filter_map(|m| m.usage) {
-                total.add(usage);
-            }
+            let total = session_usage(session);
             Ok(format!(
                 "session: {} messages · {} input + {} output tokens",
                 session.messages.len(),
