@@ -32,6 +32,7 @@ Options:
       --provider <NAME>   anthropic (default) or openai
       --model <MODEL>     model id (default per provider)
       --base-url <URL>    override API base URL
+      --max-tokens <N>    max output tokens per response
   -h, --help              show this help
 
 Output: predictions (single task) or an accuracy report (evaluation) on

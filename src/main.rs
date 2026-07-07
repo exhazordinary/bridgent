@@ -27,6 +27,7 @@ Options:
       --provider <NAME>   anthropic (default) or openai
       --model <MODEL>     model id (default per provider)
       --base-url <URL>    override API base URL (local models, proxies)
+      --max-tokens <N>    max output tokens per response
   -h, --help              show this help
   -V, --version           show version
 
