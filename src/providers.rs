@@ -68,6 +68,10 @@ pub struct Message {
     /// Present on assistant messages parsed from an API response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// True when the provider cut this reply at the output-token limit
+    /// (Anthropic `stop_reason: max_tokens`, OpenAI `finish_reason: length`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl Message {
@@ -79,6 +83,7 @@ impl Message {
             tool_call_id: None,
             is_error: false,
             usage: None,
+            truncated: false,
         }
     }
 
@@ -90,6 +95,7 @@ impl Message {
             tool_call_id: None,
             is_error: false,
             usage: None,
+            truncated: false,
         }
     }
 
@@ -113,6 +119,7 @@ impl Message {
             tool_call_id: Some(id.into()),
             is_error,
             usage: None,
+            truncated: false,
         }
     }
 }
@@ -434,11 +441,13 @@ pub fn anthropic_parse_response(body: &Value) -> Result<Message, ProviderError> 
             _ => {}
         }
     }
-    Ok(Message::assistant_with_usage(
+    let mut reply = Message::assistant_with_usage(
         content,
         tool_calls,
         parse_usage(body, "input_tokens", "output_tokens"),
-    ))
+    );
+    reply.truncated = body["stop_reason"] == "max_tokens";
+    Ok(reply)
 }
 
 impl Provider for AnthropicProvider {
@@ -558,7 +567,8 @@ pub fn openai_build_request(
 }
 
 pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
-    let message = &body["choices"][0]["message"];
+    let choice = &body["choices"][0];
+    let message = &choice["message"];
     if message.is_null() {
         return Err(ProviderError::fatal(format!(
             "unexpected response shape: {body}"
@@ -584,11 +594,13 @@ pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Message::assistant_with_usage(
+    let mut reply = Message::assistant_with_usage(
         content,
         tool_calls,
         parse_usage(body, "prompt_tokens", "completion_tokens"),
-    ))
+    );
+    reply.truncated = choice["finish_reason"] == "length";
+    Ok(reply)
 }
 
 impl Provider for OpenAIProvider {
@@ -823,6 +835,29 @@ mod tests {
                 args: json!({"path": "a.txt"})
             }]
         );
+    }
+
+    #[test]
+    fn max_tokens_stop_reasons_mark_the_reply_truncated() {
+        let reply = anthropic_parse_response(&json!({
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+        }))
+        .unwrap();
+        assert!(reply.truncated);
+
+        let reply = openai_parse_response(&json!({
+            "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+        }))
+        .unwrap();
+        assert!(reply.truncated);
+
+        let complete = anthropic_parse_response(&json!({
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+        }))
+        .unwrap();
+        assert!(!complete.truncated);
     }
 
     #[test]

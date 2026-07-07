@@ -113,6 +113,11 @@ fn print_event(event: Event) {
         Event::Compacted { kept } => {
             eprintln!("\x1b[2m⊜ history compacted to {kept} messages\x1b[0m");
         }
+        Event::Truncated => {
+            eprintln!(
+                "\x1b[33m⚠ response cut at the output-token limit; it may be incomplete\x1b[0m"
+            );
+        }
     }
 }
 

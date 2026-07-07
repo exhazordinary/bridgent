@@ -62,6 +62,7 @@ pub struct AnthropicAccumulator {
     /// JSON fragments for the tool call currently being streamed.
     pending_json: String,
     usage: Usage,
+    truncated: bool,
 }
 
 impl SseAccumulator for AnthropicAccumulator {
@@ -119,6 +120,9 @@ impl SseAccumulator for AnthropicAccumulator {
                 if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
                     self.usage.output_tokens = tokens;
                 }
+                if event["delta"]["stop_reason"] == "max_tokens" {
+                    self.truncated = true;
+                }
             }
             _ => {}
         }
@@ -126,7 +130,10 @@ impl SseAccumulator for AnthropicAccumulator {
     }
 
     fn finish(self) -> Message {
-        Message::assistant_with_usage(self.content, self.tool_calls, Some(self.usage))
+        let mut message =
+            Message::assistant_with_usage(self.content, self.tool_calls, Some(self.usage));
+        message.truncated = self.truncated;
+        message
     }
 }
 
@@ -137,6 +144,7 @@ pub struct OpenAIAccumulator {
     /// Tool calls under construction; argument JSON arrives in fragments.
     partial_calls: Vec<PartialCall>,
     usage: Option<Usage>,
+    truncated: bool,
 }
 
 #[derive(Default)]
@@ -152,7 +160,11 @@ impl SseAccumulator for OpenAIAccumulator {
         chunk: &Value,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<(), ProviderError> {
-        let delta = &chunk["choices"][0]["delta"];
+        let choice = &chunk["choices"][0];
+        if choice["finish_reason"] == "length" {
+            self.truncated = true;
+        }
+        let delta = &choice["delta"];
         if let Some(text) = delta["content"].as_str() {
             self.content.push_str(text);
             on_text(text);
@@ -193,7 +205,9 @@ impl SseAccumulator for OpenAIAccumulator {
                 name: call.name,
             })
             .collect();
-        Message::assistant_with_usage(self.content, tool_calls, self.usage)
+        let mut message = Message::assistant_with_usage(self.content, tool_calls, self.usage);
+        message.truncated = self.truncated;
+        message
     }
 }
 
@@ -309,6 +323,24 @@ mod tests {
                 ..Usage::default()
             })
         );
+    }
+
+    #[test]
+    fn streams_cut_at_the_token_limit_mark_the_message_truncated() {
+        let events = [
+            json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "par"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"},
+                   "usage": {"output_tokens": 3}}),
+        ];
+        let (acc, _) = collect_stream::<AnthropicAccumulator>(&events);
+        assert!(acc.finish().truncated);
+
+        let chunks = [
+            json!({"choices": [{"delta": {"content": "par"}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "length"}]}),
+        ];
+        let (acc, _) = collect_stream::<OpenAIAccumulator>(&chunks);
+        assert!(acc.finish().truncated);
     }
 
     #[test]
