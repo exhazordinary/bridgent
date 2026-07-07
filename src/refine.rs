@@ -58,6 +58,10 @@ pub enum RefineEvent<'a> {
 
 /// Run the generate–verify–revise loop. Returns all candidates, best first.
 /// Stops early as soon as a candidate scores `1.0`.
+///
+/// A round's candidates share one prompt and are independent, so they are
+/// sampled in parallel — a round's wall-clock is its slowest call, not the
+/// sum of all of them.
 pub fn refine(
     provider: &dyn Provider,
     base_prompt: &str,
@@ -72,20 +76,28 @@ pub fn refine(
             &pool,
             config.keep_top,
         ))];
-        for _ in 0..config.per_round {
-            let reply = provider.complete("", &seed, &[])?;
-            let content = extract_code(&reply.content);
+        let replies: Vec<Result<Message, ProviderError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..config.per_round)
+                .map(|_| scope.spawn(|| provider.complete("", &seed, &[])))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("sampling thread panicked"))
+                .collect()
+        });
+        let mut solved = false;
+        for reply in replies {
+            let content = extract_code(&reply?.content);
             let verdict = verifier.verify(&content);
-            let solved = verdict.score >= 1.0;
+            solved = solved || verdict.score >= 1.0;
             let candidate = Candidate { content, verdict };
             on_event(RefineEvent::Sampled(&candidate));
             pool.push(candidate);
-            if solved {
-                rank(&mut pool);
-                return Ok(pool);
-            }
         }
         rank(&mut pool);
+        if solved {
+            return Ok(pool);
+        }
         on_event(RefineEvent::RoundDone {
             round,
             best_score: pool.first().map_or(0.0, |c| c.verdict.score),
@@ -152,7 +164,7 @@ mod tests {
 
     /// The prompt sent on the i-th model call.
     fn prompt(provider: &ScriptedProvider, i: usize) -> String {
-        provider.calls.borrow()[i][0].content.clone()
+        provider.calls.lock().unwrap()[i][0].content.clone()
     }
 
     /// Scores a candidate by exact match against a target string.
@@ -207,6 +219,22 @@ mod tests {
         assert!(prompt(&provider, 2).contains("expected `zzz`"));
         // keep_top=1: only the single best attempt is included
         assert_eq!(prompt(&provider, 2).matches("--- Attempt").count(), 1);
+    }
+
+    #[test]
+    fn candidates_in_a_round_are_sampled_in_parallel() {
+        let mut provider = ScriptedProvider::texts(&["a", "b", "c", "d"]);
+        provider.delay = Some(std::time::Duration::from_millis(50));
+        let config = RefineConfig {
+            rounds: 1,
+            per_round: 4,
+            keep_top: 2,
+        };
+        let started = std::time::Instant::now();
+        refine(&provider, "task", &ExactVerifier("zzz"), config, |_| {}).unwrap();
+        // Sequential sampling would take >= 4 * 50ms; parallel is bounded by
+        // the slowest single call plus overhead.
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
     }
 
     #[test]

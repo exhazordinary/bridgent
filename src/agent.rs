@@ -225,7 +225,7 @@ mod tests {
 
         assert_eq!(answer, "done");
         assert_eq!(session.messages.len(), 2); // user + assistant
-        assert_eq!(provider.calls.borrow().len(), 1);
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
             ]
         );
         // Second model call must include the tool result.
-        let second_call = &provider.calls.borrow()[1];
+        let second_call = &provider.calls.lock().unwrap()[1];
         assert_eq!(
             second_call.last().unwrap().tool_call_id.as_deref(),
             Some("t1")
@@ -383,7 +383,7 @@ mod tests {
         assert!(session.messages[0].content.contains("the goal is X"));
         assert_eq!(session.messages[1].content, "msg 5");
         // The summarization request saw the old messages.
-        let prompt = &provider.calls.borrow()[0][0].content;
+        let prompt = &provider.calls.lock().unwrap()[0][0].content;
         assert!(prompt.contains("msg 0"));
         // Compaction persists: reopening yields the compacted history.
         assert_eq!(Session::open(&session.path).unwrap().messages.len(), 11);
@@ -441,7 +441,7 @@ mod tests {
             .compact(&mut session)
             .unwrap();
         assert!(!compacted);
-        assert_eq!(provider.calls.borrow().len(), 0);
+        assert_eq!(provider.calls.lock().unwrap().len(), 0);
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(compaction_events, 1);
         assert!(session.messages[0].content.contains("summary of it all"));
         // The answer's model call ran on the compacted history.
-        assert!(provider.calls.borrow()[1].len() < 15);
+        assert!(provider.calls.lock().unwrap()[1].len() < 15);
     }
 
     #[test]
@@ -490,7 +490,7 @@ mod tests {
         let error = agent.run_turn(&mut session, "hi", |_| {}).unwrap_err();
 
         assert!(error.message.contains(INTERRUPTED));
-        assert_eq!(provider.calls.borrow().len(), 0); // no model call made
+        assert_eq!(provider.calls.lock().unwrap().len(), 0); // no model call made
         assert_eq!(session.messages.len(), 1); // the user message persists
     }
 

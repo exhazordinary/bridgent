@@ -162,8 +162,9 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// A chat-completion backend: takes the conversation, returns the next
-/// assistant message (text and/or tool calls).
-pub trait Provider {
+/// assistant message (text and/or tool calls). `Send + Sync` so consumers
+/// (e.g. the refine engine) can issue calls from parallel threads.
+pub trait Provider: Send + Sync {
     fn complete(
         &self,
         system: &str,
@@ -659,20 +660,24 @@ impl Provider for OpenAIProvider {
 #[cfg(test)]
 pub mod test_support {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     /// Replays a script of canned responses and records every call's
     /// message history — the one `Provider` mock shared by all test modules.
+    /// `Mutex` (not `RefCell`) so it can serve parallel callers.
     pub struct ScriptedProvider {
-        script: RefCell<Vec<Result<Message, ProviderError>>>,
-        pub calls: RefCell<Vec<Vec<Message>>>,
+        script: Mutex<Vec<Result<Message, ProviderError>>>,
+        pub calls: Mutex<Vec<Vec<Message>>>,
+        /// Simulated per-call latency, for parallelism tests.
+        pub delay: Option<std::time::Duration>,
     }
 
     impl ScriptedProvider {
         pub fn new(script: Vec<Result<Message, ProviderError>>) -> Self {
             Self {
-                script: RefCell::new(script),
-                calls: RefCell::new(Vec::new()),
+                script: Mutex::new(script),
+                calls: Mutex::new(Vec::new()),
+                delay: None,
             }
         }
 
@@ -694,8 +699,11 @@ pub mod test_support {
             messages: &[Message],
             _tools: &[ToolSchema],
         ) -> Result<Message, ProviderError> {
-            self.calls.borrow_mut().push(messages.to_vec());
-            let mut script = self.script.borrow_mut();
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let mut script = self.script.lock().unwrap();
             if script.is_empty() {
                 return Err(ProviderError::fatal("script exhausted"));
             }
