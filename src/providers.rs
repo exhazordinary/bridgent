@@ -394,7 +394,17 @@ pub fn anthropic_build_request(
         })
         .collect();
     // System and tools are stable across a session; cache_control markers
-    // let the API reuse them instead of re-processing every request.
+    // let the API reuse them instead of re-processing every request. A third
+    // marker on the newest message block caches the conversation itself, so
+    // each agent-loop turn re-reads the prior turns instead of re-processing
+    // them (prefix caching — the previous marker stays valid as a read point).
+    if let Some(block) = out
+        .last_mut()
+        .and_then(|last| last["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
     if let Some(last) = tools.last_mut() {
         last["cache_control"] = json!({"type": "ephemeral"});
     }
@@ -724,8 +734,27 @@ mod tests {
                     "tool_use_id": "t1",
                     "content": "file data",
                     "is_error": false,
+                    "cache_control": {"type": "ephemeral"},
                 }],
             })
+        );
+    }
+
+    #[test]
+    fn anthropic_request_caches_only_the_newest_message_block() {
+        let body = anthropic_build_request("m", 100, "sys", &history(), &tools());
+        let msgs = body["messages"].as_array().unwrap();
+        // Only the final block of the final message carries the marker, so
+        // the whole conversation prefix is reusable on the next request.
+        for msg in &msgs[..msgs.len() - 1] {
+            for block in msg["content"].as_array().unwrap() {
+                assert!(block.get("cache_control").is_none(), "early block cached");
+            }
+        }
+        let last_blocks = msgs.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(
+            last_blocks.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"})
         );
     }
 
