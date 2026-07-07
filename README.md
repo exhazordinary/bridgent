@@ -20,7 +20,9 @@ Built on the converging lessons of harness-engineering research and practice:
   results back, repeat until it answers in plain text. No step limits.
 - **Errors are feedback, not failures.** Tool errors go back to the model
   verbatim so it can correct course; transient provider errors retry with
-  backoff. *(Anthropic, "Effective harnesses for long-running agents")*
+  backoff (honoring `retry-after`), and replies cut at the token limit are
+  flagged instead of passed off as complete. *(Anthropic, "Effective
+  harnesses for long-running agents")*
 - **State lives in files.** Sessions are append-only JSONL in
   `.bridgent/sessions/` — crash-safe, greppable, resumable. *(hermes)*
 - **Core is separate from frontend.** The library (`bridgent::agent`,
@@ -50,7 +52,10 @@ bridgent --sessions                            # list sessions in this directory
 Responses stream token by token. Inside the REPL, `/help` lists session
 commands: `/new`, `/compact` (summarize old history to reclaim context —
 this also happens automatically as the session grows), and `/usage` (token
-totals). Any OpenAI-compatible server works, including local models:
+totals, including prompt-cache reads and writes). Anthropic requests carry
+cache markers on the system prompt, tools, and conversation, so long agent
+sessions bill most input at cache-read rates. Any OpenAI-compatible server
+works, including local models:
 
 ```sh
 bridgent --provider openai --base-url http://localhost:11434/v1 --model qwen3 "hi"
