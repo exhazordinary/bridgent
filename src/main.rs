@@ -113,6 +113,11 @@ fn print_event(event: Event) {
         Event::Compacted { kept } => {
             eprintln!("\x1b[2m⊜ history compacted to {kept} messages\x1b[0m");
         }
+        Event::Truncated => {
+            eprintln!(
+                "\x1b[33m⚠ response cut at the output-token limit; it may be incomplete\x1b[0m"
+            );
+        }
     }
 }
 
@@ -291,12 +296,19 @@ impl Repl {
             }
             ("usage", _) => {
                 let total = self.session.usage();
-                Ok(format!(
+                let mut line = format!(
                     "session: {} messages · {} input + {} output tokens",
                     self.session.messages.len(),
                     total.input_tokens,
                     total.output_tokens
-                ))
+                );
+                if total.cache_read_input_tokens + total.cache_creation_input_tokens > 0 {
+                    line.push_str(&format!(
+                        " · cache: {} read, {} written",
+                        total.cache_read_input_tokens, total.cache_creation_input_tokens
+                    ));
+                }
+                Ok(line)
             }
             (other, _) => Err(format!("unknown command /{other} (try /help)")),
         }

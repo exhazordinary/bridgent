@@ -32,12 +32,24 @@ pub enum Role {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens written to the prompt cache this request (billed above input rate).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: u64,
+    /// Tokens served from the prompt cache this request (billed below input rate).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_input_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Usage {
     pub fn add(&mut self, other: Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
     }
 }
 
@@ -56,6 +68,10 @@ pub struct Message {
     /// Present on assistant messages parsed from an API response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// True when the provider cut this reply at the output-token limit
+    /// (Anthropic `stop_reason: max_tokens`, OpenAI `finish_reason: length`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl Message {
@@ -67,6 +83,7 @@ impl Message {
             tool_call_id: None,
             is_error: false,
             usage: None,
+            truncated: false,
         }
     }
 
@@ -78,6 +95,7 @@ impl Message {
             tool_call_id: None,
             is_error: false,
             usage: None,
+            truncated: false,
         }
     }
 
@@ -101,6 +119,7 @@ impl Message {
             tool_call_id: Some(id.into()),
             is_error,
             usage: None,
+            truncated: false,
         }
     }
 }
@@ -111,6 +130,9 @@ pub struct ProviderError {
     /// Worth retrying: rate limits, overload, network failures. Bad requests
     /// and auth failures are not.
     pub retryable: bool,
+    /// Server-requested wait before retrying (the `retry-after` header),
+    /// which overrides the client's own backoff schedule.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ProviderError {
@@ -118,6 +140,7 @@ impl ProviderError {
         Self {
             message: message.into(),
             retryable: false,
+            retry_after: None,
         }
     }
 
@@ -125,6 +148,7 @@ impl ProviderError {
         Self {
             message: message.into(),
             retryable: true,
+            retry_after: None,
         }
     }
 }
@@ -195,15 +219,15 @@ impl RetryingProvider {
     ) -> Result<T, ProviderError> {
         let mut delay = self.retry_delay;
         for attempt in 1.. {
-            if attempt > 1 {
-                std::thread::sleep(delay);
-                delay *= 2;
-            }
             let (result, abort) = call();
             match result {
                 Ok(value) => return Ok(value),
                 Err(e) if !e.retryable || abort || attempt >= self.max_attempts => return Err(e),
-                Err(_) => {}
+                // The server's retry-after beats our own backoff schedule.
+                Err(e) => {
+                    std::thread::sleep(e.retry_after.unwrap_or(delay));
+                    delay *= 2;
+                }
             }
         }
         unreachable!("retry loop always returns")
@@ -252,10 +276,13 @@ fn send(
     match request.send_json(body) {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(code, response)) => {
+            let retry_after = response.header("retry-after").and_then(parse_retry_after);
             let detail = response.into_string().unwrap_or_default();
             let message = format!("HTTP {code}: {detail}");
             if matches!(code, 408 | 429 | 500..=599) {
-                Err(ProviderError::transient(message))
+                let mut error = ProviderError::transient(message);
+                error.retry_after = retry_after;
+                Err(error)
             } else {
                 Err(ProviderError::fatal(message))
             }
@@ -263,6 +290,13 @@ fn send(
         // Transport-level failures (DNS, refused, reset) are worth retrying.
         Err(e) => Err(ProviderError::transient(e.to_string())),
     }
+}
+
+/// The delay-seconds form of `retry-after`, capped to a sane maximum.
+/// (The HTTP-date form is rare on LLM APIs and not worth a date parser.)
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(seconds.min(120)))
 }
 
 fn post(url: &str, headers: &[(String, String)], body: Value) -> Result<Value, ProviderError> {
@@ -276,6 +310,13 @@ pub(crate) fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Op
     Some(Usage {
         input_tokens: usage[input_key].as_u64().unwrap_or(0),
         output_tokens: usage[output_key].as_u64().unwrap_or(0),
+        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        // Anthropic reports cache reads at the top level; OpenAI-compatible
+        // servers nest them under prompt_tokens_details.
+        cache_read_input_tokens: usage["cache_read_input_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+            .unwrap_or(0),
     })
 }
 
@@ -375,7 +416,17 @@ pub fn anthropic_build_request(
         })
         .collect();
     // System and tools are stable across a session; cache_control markers
-    // let the API reuse them instead of re-processing every request.
+    // let the API reuse them instead of re-processing every request. A third
+    // marker on the newest message block caches the conversation itself, so
+    // each agent-loop turn re-reads the prior turns instead of re-processing
+    // them (prefix caching — the previous marker stays valid as a read point).
+    if let Some(block) = out
+        .last_mut()
+        .and_then(|last| last["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
     if let Some(last) = tools.last_mut() {
         last["cache_control"] = json!({"type": "ephemeral"});
     }
@@ -405,11 +456,13 @@ pub fn anthropic_parse_response(body: &Value) -> Result<Message, ProviderError> 
             _ => {}
         }
     }
-    Ok(Message::assistant_with_usage(
+    let mut reply = Message::assistant_with_usage(
         content,
         tool_calls,
         parse_usage(body, "input_tokens", "output_tokens"),
-    ))
+    );
+    reply.truncated = body["stop_reason"] == "max_tokens";
+    Ok(reply)
 }
 
 impl Provider for AnthropicProvider {
@@ -529,7 +582,8 @@ pub fn openai_build_request(
 }
 
 pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
-    let message = &body["choices"][0]["message"];
+    let choice = &body["choices"][0];
+    let message = &choice["message"];
     if message.is_null() {
         return Err(ProviderError::fatal(format!(
             "unexpected response shape: {body}"
@@ -555,11 +609,13 @@ pub fn openai_parse_response(body: &Value) -> Result<Message, ProviderError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Message::assistant_with_usage(
+    let mut reply = Message::assistant_with_usage(
         content,
         tool_calls,
         parse_usage(body, "prompt_tokens", "completion_tokens"),
-    ))
+    );
+    reply.truncated = choice["finish_reason"] == "length";
+    Ok(reply)
 }
 
 impl Provider for OpenAIProvider {
@@ -705,8 +761,27 @@ mod tests {
                     "tool_use_id": "t1",
                     "content": "file data",
                     "is_error": false,
+                    "cache_control": {"type": "ephemeral"},
                 }],
             })
+        );
+    }
+
+    #[test]
+    fn anthropic_request_caches_only_the_newest_message_block() {
+        let body = anthropic_build_request("m", 100, "sys", &history(), &tools());
+        let msgs = body["messages"].as_array().unwrap();
+        // Only the final block of the final message carries the marker, so
+        // the whole conversation prefix is reusable on the next request.
+        for msg in &msgs[..msgs.len() - 1] {
+            for block in msg["content"].as_array().unwrap() {
+                assert!(block.get("cache_control").is_none(), "early block cached");
+            }
+        }
+        let last_blocks = msgs.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(
+            last_blocks.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"})
         );
     }
 
@@ -748,7 +823,12 @@ mod tests {
                 {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.txt"}},
             ],
             "stop_reason": "tool_use",
-            "usage": {"input_tokens": 120, "output_tokens": 45},
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "cache_creation_input_tokens": 2000,
+                "cache_read_input_tokens": 30000,
+            },
         }))
         .unwrap();
         assert_eq!(reply.role, Role::Assistant);
@@ -757,7 +837,9 @@ mod tests {
             reply.usage,
             Some(Usage {
                 input_tokens: 120,
-                output_tokens: 45
+                output_tokens: 45,
+                cache_creation_input_tokens: 2000,
+                cache_read_input_tokens: 30000,
             })
         );
         assert_eq!(
@@ -768,6 +850,29 @@ mod tests {
                 args: json!({"path": "a.txt"})
             }]
         );
+    }
+
+    #[test]
+    fn max_tokens_stop_reasons_mark_the_reply_truncated() {
+        let reply = anthropic_parse_response(&json!({
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+        }))
+        .unwrap();
+        assert!(reply.truncated);
+
+        let reply = openai_parse_response(&json!({
+            "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+        }))
+        .unwrap();
+        assert!(reply.truncated);
+
+        let complete = anthropic_parse_response(&json!({
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+        }))
+        .unwrap();
+        assert!(!complete.truncated);
     }
 
     #[test]
@@ -804,7 +909,11 @@ mod tests {
                     }],
                 },
             }],
-            "usage": {"prompt_tokens": 80, "completion_tokens": 20},
+            "usage": {
+                "prompt_tokens": 80,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 64},
+            },
         }))
         .unwrap();
         assert_eq!(reply.content, "");
@@ -812,7 +921,9 @@ mod tests {
             reply.usage,
             Some(Usage {
                 input_tokens: 80,
-                output_tokens: 20
+                output_tokens: 20,
+                cache_read_input_tokens: 64,
+                ..Usage::default()
             })
         );
         assert_eq!(
@@ -885,6 +996,41 @@ mod tests {
             .complete("sys", &[Message::user("hi")], &[])
             .unwrap_err();
         assert!(error.message.contains("boom 3"));
+    }
+
+    #[test]
+    fn retry_after_header_parses_seconds_and_caps_extremes() {
+        assert_eq!(
+            parse_retry_after("5"),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_retry_after(" 30 "),
+            Some(std::time::Duration::from_secs(30))
+        );
+        // Absurd values are capped; date form is ignored.
+        assert_eq!(
+            parse_retry_after("86400"),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn retrying_provider_honors_the_server_retry_after() {
+        let mut rate_limited = ProviderError::transient("HTTP 429: slow down");
+        rate_limited.retry_after = Some(std::time::Duration::from_millis(50));
+        let provider = retrying(vec![
+            Err(rate_limited),
+            Ok(Message::assistant("recovered", vec![])),
+        ]);
+        let started = std::time::Instant::now();
+        provider
+            .complete("sys", &[Message::user("hi")], &[])
+            .unwrap();
+        // The 1ms test backoff would return immediately; the server-requested
+        // 50ms wait is what actually elapsed.
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
     #[test]

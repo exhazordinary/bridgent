@@ -32,6 +32,9 @@ pub enum Event<'a> {
     Compacted {
         kept: usize,
     },
+    /// The provider cut the reply at the output-token limit; the text (or a
+    /// tool call) may be incomplete.
+    Truncated,
 }
 
 impl Event<'_> {
@@ -50,6 +53,7 @@ impl Event<'_> {
                 "output": result.output,
             }),
             Event::Compacted { kept } => json!({"type": "compacted", "kept": kept}),
+            Event::Truncated => json!({"type": "truncated"}),
         }
     }
 }
@@ -119,6 +123,9 @@ impl<'a> Agent<'a> {
             )?;
             if !reply.content.is_empty() {
                 on_event(Event::AssistantText(&reply.content));
+            }
+            if reply.truncated {
+                on_event(Event::Truncated);
             }
             if reply.tool_calls.is_empty() {
                 let answer = reply.content.clone();
@@ -248,6 +255,7 @@ mod tests {
                     Event::ToolStart(c) => format!("start:{}", c.name),
                     Event::ToolEnd(c, r) => format!("end:{}:{}", c.name, r.output),
                     Event::Compacted { kept } => format!("compacted:{kept}"),
+                    Event::Truncated => "truncated".into(),
                 });
             })
             .unwrap();
@@ -274,6 +282,24 @@ mod tests {
             second_call.last().unwrap().tool_call_id.as_deref(),
             Some("t1")
         );
+    }
+
+    #[test]
+    fn truncated_replies_surface_an_event() {
+        let dir = TempDir::new().unwrap();
+        let tools = crate::tools::default_registry(dir.path());
+        let mut reply = Message::assistant("partial answ", vec![]);
+        reply.truncated = true;
+        let provider = ScriptedProvider::new(vec![Ok(reply)]);
+        let mut session = Session::create(dir.path()).unwrap();
+
+        let mut saw_truncated = false;
+        agent_fixture(&provider, &tools)
+            .run_turn(&mut session, "hello", |event| {
+                saw_truncated = saw_truncated || matches!(event, Event::Truncated);
+            })
+            .unwrap();
+        assert!(saw_truncated);
     }
 
     #[test]

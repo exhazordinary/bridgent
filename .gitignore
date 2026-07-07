@@ -1,3 +1,4 @@
 /target
 .bridgent/
 .claude/
+.pytest_cache/
