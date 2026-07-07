@@ -32,12 +32,24 @@ pub enum Role {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens written to the prompt cache this request (billed above input rate).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: u64,
+    /// Tokens served from the prompt cache this request (billed below input rate).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_input_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Usage {
     pub fn add(&mut self, other: Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
     }
 }
 
@@ -276,6 +288,13 @@ pub(crate) fn parse_usage(body: &Value, input_key: &str, output_key: &str) -> Op
     Some(Usage {
         input_tokens: usage[input_key].as_u64().unwrap_or(0),
         output_tokens: usage[output_key].as_u64().unwrap_or(0),
+        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        // Anthropic reports cache reads at the top level; OpenAI-compatible
+        // servers nest them under prompt_tokens_details.
+        cache_read_input_tokens: usage["cache_read_input_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+            .unwrap_or(0),
     })
 }
 
@@ -748,7 +767,12 @@ mod tests {
                 {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.txt"}},
             ],
             "stop_reason": "tool_use",
-            "usage": {"input_tokens": 120, "output_tokens": 45},
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "cache_creation_input_tokens": 2000,
+                "cache_read_input_tokens": 30000,
+            },
         }))
         .unwrap();
         assert_eq!(reply.role, Role::Assistant);
@@ -757,7 +781,9 @@ mod tests {
             reply.usage,
             Some(Usage {
                 input_tokens: 120,
-                output_tokens: 45
+                output_tokens: 45,
+                cache_creation_input_tokens: 2000,
+                cache_read_input_tokens: 30000,
             })
         );
         assert_eq!(
@@ -804,7 +830,11 @@ mod tests {
                     }],
                 },
             }],
-            "usage": {"prompt_tokens": 80, "completion_tokens": 20},
+            "usage": {
+                "prompt_tokens": 80,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 64},
+            },
         }))
         .unwrap();
         assert_eq!(reply.content, "");
@@ -812,7 +842,9 @@ mod tests {
             reply.usage,
             Some(Usage {
                 input_tokens: 80,
-                output_tokens: 20
+                output_tokens: 20,
+                cache_read_input_tokens: 64,
+                ..Usage::default()
             })
         );
         assert_eq!(

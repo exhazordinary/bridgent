@@ -77,9 +77,12 @@ impl SseAccumulator for AnthropicAccumulator {
                 ))
             }
             Some("message_start") => {
-                self.usage.input_tokens = event["message"]["usage"]["input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
+                // message_start carries the full input-side usage, cache
+                // accounting included; output_tokens arrives in message_delta.
+                if let Some(usage) = parse_usage(&event["message"], "input_tokens", "output_tokens")
+                {
+                    self.usage = usage;
+                }
             }
             Some("content_block_start") => {
                 let block = &event["content_block"];
@@ -223,7 +226,11 @@ mod tests {
     #[test]
     fn anthropic_accumulates_text_and_usage() {
         let events = [
-            json!({"type": "message_start", "message": {"usage": {"input_tokens": 50}}}),
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 50,
+                "cache_creation_input_tokens": 1200,
+                "cache_read_input_tokens": 8000,
+            }}}),
             json!({"type": "content_block_start", "content_block": {"type": "text"}}),
             json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hel"}}),
             json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}}),
@@ -238,7 +245,9 @@ mod tests {
             message.usage,
             Some(Usage {
                 input_tokens: 50,
-                output_tokens: 7
+                output_tokens: 7,
+                cache_creation_input_tokens: 1200,
+                cache_read_input_tokens: 8000,
             })
         );
     }
@@ -296,7 +305,8 @@ mod tests {
             message.usage,
             Some(Usage {
                 input_tokens: 9,
-                output_tokens: 4
+                output_tokens: 4,
+                ..Usage::default()
             })
         );
     }
