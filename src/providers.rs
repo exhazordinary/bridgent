@@ -130,6 +130,9 @@ pub struct ProviderError {
     /// Worth retrying: rate limits, overload, network failures. Bad requests
     /// and auth failures are not.
     pub retryable: bool,
+    /// Server-requested wait before retrying (the `retry-after` header),
+    /// which overrides the client's own backoff schedule.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ProviderError {
@@ -137,6 +140,7 @@ impl ProviderError {
         Self {
             message: message.into(),
             retryable: false,
+            retry_after: None,
         }
     }
 
@@ -144,6 +148,7 @@ impl ProviderError {
         Self {
             message: message.into(),
             retryable: true,
+            retry_after: None,
         }
     }
 }
@@ -214,15 +219,15 @@ impl RetryingProvider {
     ) -> Result<T, ProviderError> {
         let mut delay = self.retry_delay;
         for attempt in 1.. {
-            if attempt > 1 {
-                std::thread::sleep(delay);
-                delay *= 2;
-            }
             let (result, abort) = call();
             match result {
                 Ok(value) => return Ok(value),
                 Err(e) if !e.retryable || abort || attempt >= self.max_attempts => return Err(e),
-                Err(_) => {}
+                // The server's retry-after beats our own backoff schedule.
+                Err(e) => {
+                    std::thread::sleep(e.retry_after.unwrap_or(delay));
+                    delay *= 2;
+                }
             }
         }
         unreachable!("retry loop always returns")
@@ -271,10 +276,13 @@ fn send(
     match request.send_json(body) {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(code, response)) => {
+            let retry_after = response.header("retry-after").and_then(parse_retry_after);
             let detail = response.into_string().unwrap_or_default();
             let message = format!("HTTP {code}: {detail}");
             if matches!(code, 408 | 429 | 500..=599) {
-                Err(ProviderError::transient(message))
+                let mut error = ProviderError::transient(message);
+                error.retry_after = retry_after;
+                Err(error)
             } else {
                 Err(ProviderError::fatal(message))
             }
@@ -282,6 +290,13 @@ fn send(
         // Transport-level failures (DNS, refused, reset) are worth retrying.
         Err(e) => Err(ProviderError::transient(e.to_string())),
     }
+}
+
+/// The delay-seconds form of `retry-after`, capped to a sane maximum.
+/// (The HTTP-date form is rare on LLM APIs and not worth a date parser.)
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(seconds.min(120)))
 }
 
 fn post(url: &str, headers: &[(String, String)], body: Value) -> Result<Value, ProviderError> {
@@ -981,6 +996,41 @@ mod tests {
             .complete("sys", &[Message::user("hi")], &[])
             .unwrap_err();
         assert!(error.message.contains("boom 3"));
+    }
+
+    #[test]
+    fn retry_after_header_parses_seconds_and_caps_extremes() {
+        assert_eq!(
+            parse_retry_after("5"),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_retry_after(" 30 "),
+            Some(std::time::Duration::from_secs(30))
+        );
+        // Absurd values are capped; date form is ignored.
+        assert_eq!(
+            parse_retry_after("86400"),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn retrying_provider_honors_the_server_retry_after() {
+        let mut rate_limited = ProviderError::transient("HTTP 429: slow down");
+        rate_limited.retry_after = Some(std::time::Duration::from_millis(50));
+        let provider = retrying(vec![
+            Err(rate_limited),
+            Ok(Message::assistant("recovered", vec![])),
+        ]);
+        let started = std::time::Instant::now();
+        provider
+            .complete("sys", &[Message::user("hi")], &[])
+            .unwrap();
+        // The 1ms test backoff would return immediately; the server-requested
+        // 50ms wait is what actually elapsed.
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
     }
 
     #[test]
