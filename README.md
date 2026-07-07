@@ -68,6 +68,7 @@ bridgent --provider openai --base-url http://localhost:11434/v1 --model qwen3 "h
 | `--provider` | `BRIDGENT_PROVIDER` | `anthropic` |
 | `--model` | `BRIDGENT_MODEL` | per provider |
 | `--base-url` | `BRIDGENT_BASE_URL` | provider default |
+| `--max-tokens` | `BRIDGENT_MAX_TOKENS` | 8192 (anthropic) / server default (openai) |
 | — | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | required (unless `--base-url` or a bearer token is set) |
 | — | `ANTHROPIC_AUTH_TOKEN` | optional bearer token, replaces the API key |
 

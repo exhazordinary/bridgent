@@ -504,6 +504,8 @@ pub struct OpenAIProvider {
     pub api_key: String,
     pub model: String,
     pub base_url: String,
+    /// Max output tokens per response; the server default when unset.
+    pub max_tokens: Option<u32>,
 }
 
 impl OpenAIProvider {
@@ -512,6 +514,7 @@ impl OpenAIProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: "https://api.openai.com/v1".into(),
+            max_tokens: None,
         }
     }
 
@@ -526,6 +529,7 @@ impl OpenAIProvider {
 
 pub fn openai_build_request(
     model: &str,
+    max_tokens: Option<u32>,
     system: &str,
     messages: &[Message],
     tools: &[ToolSchema],
@@ -578,6 +582,9 @@ pub fn openai_build_request(
     if !functions.is_empty() {
         body["tools"] = json!(functions);
     }
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
     body
 }
 
@@ -625,7 +632,7 @@ impl Provider for OpenAIProvider {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<Message, ProviderError> {
-        let body = openai_build_request(&self.model, system, messages, tools);
+        let body = openai_build_request(&self.model, self.max_tokens, system, messages, tools);
         let response = post(&self.url(), &self.headers(), body)?;
         openai_parse_response(&response)
     }
@@ -637,7 +644,7 @@ impl Provider for OpenAIProvider {
         tools: &[ToolSchema],
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Message, ProviderError> {
-        let mut body = openai_build_request(&self.model, system, messages, tools);
+        let mut body = openai_build_request(&self.model, self.max_tokens, system, messages, tools);
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
         let response = send(&self.url(), &self.headers(), body)?;
@@ -882,7 +889,7 @@ mod tests {
 
     #[test]
     fn openai_request_shapes_history_and_tools() {
-        let body = openai_build_request("m", "sys", &history(), &tools());
+        let body = openai_build_request("m", Some(4096), "sys", &history(), &tools());
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0], json!({"role": "system", "content": "sys"}));
         assert_eq!(msgs[1], json!({"role": "user", "content": "hi"}));
@@ -893,6 +900,10 @@ mod tests {
         );
         assert_eq!(body["tools"][0]["function"]["name"], "read");
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+        assert_eq!(body["max_tokens"], 4096);
+        // Unset means the server default: the key must be absent entirely.
+        let body = openai_build_request("m", None, "sys", &history(), &tools());
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

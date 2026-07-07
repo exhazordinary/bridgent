@@ -56,39 +56,45 @@ pub struct Config {
     /// OAuth-issued credentials; takes precedence over the API key.
     pub auth_token: Option<String>,
     pub base_url: Option<String>,
+    /// Max output tokens per response; falls back to the provider default.
+    pub max_tokens: Option<u32>,
 }
 
 impl Config {
     /// Resolve config from the process environment and parsed CLI flags.
     pub fn from_env(flags: &crate::cli::ProviderFlags) -> Result<Self, String> {
-        Self::resolve(
-            |key| std::env::var(key).ok(),
-            flags.provider.as_deref(),
-            flags.model.as_deref(),
-            flags.base_url.as_deref(),
-        )
+        Self::resolve(|key| std::env::var(key).ok(), flags)
     }
 
     /// Resolve config from an environment lookup (injectable for tests) and
-    /// optional flag overrides.
+    /// flag overrides.
     pub fn resolve(
         env: impl Fn(&str) -> Option<String>,
-        provider_flag: Option<&str>,
-        model_flag: Option<&str>,
-        base_url_flag: Option<&str>,
+        flags: &crate::cli::ProviderFlags,
     ) -> Result<Self, String> {
-        let provider_name = provider_flag
-            .map(str::to_string)
+        let provider_name = flags
+            .provider
+            .clone()
             .or_else(|| env("BRIDGENT_PROVIDER"))
             .unwrap_or_else(|| "anthropic".into());
         let provider = ProviderKind::parse(&provider_name)?;
-        let model = model_flag
-            .map(str::to_string)
+        let model = flags
+            .model
+            .clone()
             .or_else(|| env("BRIDGENT_MODEL"))
             .unwrap_or_else(|| provider.default_model().into());
-        let base_url = base_url_flag
-            .map(str::to_string)
-            .or_else(|| env("BRIDGENT_BASE_URL"));
+        let base_url = flags.base_url.clone().or_else(|| env("BRIDGENT_BASE_URL"));
+        let max_tokens = flags
+            .max_tokens
+            .clone()
+            .or_else(|| env("BRIDGENT_MAX_TOKENS"))
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid max tokens '{value}' (expected an integer)"))
+            })
+            .transpose()?;
         let auth_token = provider.auth_token_var().and_then(&env);
         // Local OpenAI-compatible servers (ollama, vllm) don't need a real
         // key, and a bearer token replaces the API key entirely.
@@ -109,6 +115,7 @@ impl Config {
             api_key,
             auth_token,
             base_url,
+            max_tokens,
         })
     }
 
@@ -121,6 +128,9 @@ impl Config {
                 if let Some(url) = &self.base_url {
                     p.base_url = url.clone();
                 }
+                if let Some(max_tokens) = self.max_tokens {
+                    p.max_tokens = max_tokens;
+                }
                 Box::new(p)
             }
             ProviderKind::OpenAI => {
@@ -128,6 +138,7 @@ impl Config {
                 if let Some(url) = &self.base_url {
                     p.base_url = url.clone();
                 }
+                p.max_tokens = self.max_tokens;
                 Box::new(p)
             }
         };
@@ -138,6 +149,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ProviderFlags;
     use std::collections::HashMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -148,19 +160,32 @@ mod tests {
         move |key| map.get(key).cloned()
     }
 
+    fn flags(provider: Option<&str>, model: Option<&str>, base_url: Option<&str>) -> ProviderFlags {
+        ProviderFlags {
+            provider: provider.map(String::from),
+            model: model.map(String::from),
+            base_url: base_url.map(String::from),
+            max_tokens: None,
+        }
+    }
+
     #[test]
     fn defaults_to_anthropic_with_key_from_env() {
-        let config =
-            Config::resolve(env_of(&[("ANTHROPIC_API_KEY", "sk-ant")]), None, None, None).unwrap();
+        let config = Config::resolve(
+            env_of(&[("ANTHROPIC_API_KEY", "sk-ant")]),
+            &flags(None, None, None),
+        )
+        .unwrap();
         assert_eq!(config.provider, ProviderKind::Anthropic);
         assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.api_key, "sk-ant");
         assert_eq!(config.base_url, None);
+        assert_eq!(config.max_tokens, None);
     }
 
     #[test]
     fn missing_api_key_is_a_clear_error() {
-        let error = Config::resolve(env_of(&[]), None, None, None).unwrap_err();
+        let error = Config::resolve(env_of(&[]), &flags(None, None, None)).unwrap_err();
         assert!(error.contains("ANTHROPIC_API_KEY"));
     }
 
@@ -171,7 +196,8 @@ mod tests {
             ("BRIDGENT_MODEL", "env-model"),
             ("OPENAI_API_KEY", "sk-oai"),
         ]);
-        let config = Config::resolve(env, Some("openai"), Some("flag-model"), None).unwrap();
+        let config =
+            Config::resolve(env, &flags(Some("openai"), Some("flag-model"), None)).unwrap();
         assert_eq!(config.provider, ProviderKind::OpenAI);
         assert_eq!(config.model, "flag-model");
         assert_eq!(config.api_key, "sk-oai");
@@ -180,7 +206,7 @@ mod tests {
     #[test]
     fn openai_env_provider_gets_openai_default_model() {
         let env = env_of(&[("BRIDGENT_PROVIDER", "openai"), ("OPENAI_API_KEY", "k")]);
-        let config = Config::resolve(env, None, None, None).unwrap();
+        let config = Config::resolve(env, &flags(None, None, None)).unwrap();
         assert_eq!(config.model, "gpt-5.2");
     }
 
@@ -188,9 +214,11 @@ mod tests {
     fn local_base_url_needs_no_api_key() {
         let config = Config::resolve(
             env_of(&[]),
-            Some("openai"),
-            Some("qwen3"),
-            Some("http://localhost:11434/v1"),
+            &flags(
+                Some("openai"),
+                Some("qwen3"),
+                Some("http://localhost:11434/v1"),
+            ),
         )
         .unwrap();
         assert_eq!(config.api_key, "");
@@ -204,9 +232,7 @@ mod tests {
     fn bearer_token_replaces_api_key_for_anthropic() {
         let config = Config::resolve(
             env_of(&[("ANTHROPIC_AUTH_TOKEN", "oauth-tok")]),
-            None,
-            None,
-            None,
+            &flags(None, None, None),
         )
         .unwrap();
         assert_eq!(config.auth_token.as_deref(), Some("oauth-tok"));
@@ -216,13 +242,29 @@ mod tests {
     #[test]
     fn bearer_token_is_ignored_for_openai() {
         let env = env_of(&[("ANTHROPIC_AUTH_TOKEN", "tok"), ("OPENAI_API_KEY", "k")]);
-        let config = Config::resolve(env, Some("openai"), None, None).unwrap();
+        let config = Config::resolve(env, &flags(Some("openai"), None, None)).unwrap();
         assert_eq!(config.auth_token, None);
     }
 
     #[test]
     fn unknown_provider_is_rejected() {
-        let error = Config::resolve(env_of(&[]), Some("gemini"), None, None).unwrap_err();
+        let error = Config::resolve(env_of(&[]), &flags(Some("gemini"), None, None)).unwrap_err();
         assert!(error.contains("gemini"));
+    }
+
+    #[test]
+    fn max_tokens_resolves_from_flag_or_env_and_rejects_garbage() {
+        let env = env_of(&[("ANTHROPIC_API_KEY", "k"), ("BRIDGENT_MAX_TOKENS", "16000")]);
+        let config = Config::resolve(&env, &flags(None, None, None)).unwrap();
+        assert_eq!(config.max_tokens, Some(16000));
+
+        let mut with_flag = flags(None, None, None);
+        with_flag.max_tokens = Some("32000".into());
+        let config = Config::resolve(&env, &with_flag).unwrap();
+        assert_eq!(config.max_tokens, Some(32000)); // flag beats env
+
+        with_flag.max_tokens = Some("lots".into());
+        let error = Config::resolve(&env, &with_flag).unwrap_err();
+        assert!(error.contains("lots"));
     }
 }

@@ -11,13 +11,15 @@ pub fn flag_value(iter: &mut std::slice::Iter<String>, name: &str) -> Result<Str
         .ok_or_else(|| format!("{name} requires a value"))
 }
 
-/// Provider selection flags (`--provider`, `--model`, `--base-url`) shared
-/// by every binary, in the shape `Config::from_env` consumes.
+/// Provider selection flags (`--provider`, `--model`, `--base-url`,
+/// `--max-tokens`) shared by every binary, in the shape `Config::from_env`
+/// consumes.
 #[derive(Debug, Default)]
 pub struct ProviderFlags {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub max_tokens: Option<String>,
 }
 
 impl ProviderFlags {
@@ -31,6 +33,7 @@ impl ProviderFlags {
             "--provider" => self.provider = Some(flag_value(iter, "--provider")?),
             "--model" => self.model = Some(flag_value(iter, "--model")?),
             "--base-url" => self.base_url = Some(flag_value(iter, "--base-url")?),
+            "--max-tokens" => self.max_tokens = Some(flag_value(iter, "--max-tokens")?),
             _ => return Ok(false),
         }
         Ok(true)
