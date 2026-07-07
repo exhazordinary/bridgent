@@ -340,12 +340,23 @@ impl Tool for BashTool {
         let mut output = process.stdout;
         output.push_str(&process.stderr);
         if output.len() > Self::MAX_OUTPUT_CHARS {
-            let mut end = Self::MAX_OUTPUT_CHARS;
-            while !output.is_char_boundary(end) {
-                end -= 1;
+            // Keep the head and the tail: build/test failures usually sit at
+            // the end, so dropping the middle loses the least signal.
+            let half = Self::MAX_OUTPUT_CHARS / 2;
+            let mut head_end = half;
+            while !output.is_char_boundary(head_end) {
+                head_end -= 1;
             }
-            output.truncate(end);
-            output.push_str("\n[truncated]");
+            let mut tail_start = output.len() - half;
+            while !output.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            output = format!(
+                "{}\n[truncated {} chars in the middle]\n{}",
+                &output[..head_end],
+                tail_start - head_end,
+                &output[tail_start..]
+            );
         }
         if output.is_empty() {
             output.push_str("[no output]");
@@ -531,13 +542,15 @@ mod tests {
     }
 
     #[test]
-    fn bash_output_is_capped() {
+    fn bash_output_is_capped_keeping_head_and_tail() {
         let dir = workdir();
         let output = BashTool::new(dir.path())
-            .run(&json!({"command": "yes | head -c 1000000"}))
+            .run(&json!({"command": "echo FIRST; yes | head -c 1000000; echo LAST"}))
             .unwrap();
         assert!(output.len() <= BashTool::MAX_OUTPUT_CHARS + 100);
-        assert!(output.contains("[truncated]"));
+        assert!(output.starts_with("FIRST"));
+        assert!(output.trim_end().ends_with("LAST"));
+        assert!(output.contains("chars in the middle"));
     }
 
     #[test]
